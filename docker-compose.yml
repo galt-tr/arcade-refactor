@@ -1,0 +1,40 @@
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /tmp/kraft-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    ports:
+      - "9092:9092"
+
+  aerospike:
+    image: aerospike/aerospike-server:7.1.0.0
+    ports:
+      - "3000:3000"
+    volumes:
+      - aerospike-data:/opt/aerospike/data
+
+  arcade:
+    build: .
+    depends_on:
+      - kafka
+      - aerospike
+    environment:
+      ARCADE_MODE: all
+      ARCADE_KAFKA_BROKERS: kafka:9092
+      ARCADE_AEROSPIKE_HOSTS: aerospike:3000
+      ARCADE_API_PORT: "8080"
+      ARCADE_LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+
+volumes:
+  aerospike-data:
