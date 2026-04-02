@@ -3,7 +3,10 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"time"
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
@@ -11,6 +14,10 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/models"
 )
+
+func isKeyNotFound(err error) bool {
+	return errors.Is(err, aero.ErrKeyNotFound)
+}
 
 const (
 	setTransactions   = "transactions"
@@ -32,8 +39,17 @@ type AerospikeStore struct {
 func NewAerospikeStore(cfg config.Aero) (*AerospikeStore, error) {
 	hosts := make([]*aero.Host, 0, len(cfg.Hosts))
 	for _, h := range cfg.Hosts {
-		host := aero.NewHost(h, 3000)
-		hosts = append(hosts, host)
+		hostname, portStr, err := net.SplitHostPort(h)
+		if err != nil {
+			// No port specified, use default
+			hosts = append(hosts, aero.NewHost(h, 3000))
+			continue
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port in host %q: %w", h, err)
+		}
+		hosts = append(hosts, aero.NewHost(hostname, port))
 	}
 
 	policy := aero.NewClientPolicy()
@@ -74,7 +90,7 @@ func (s *AerospikeStore) GetOrInsertStatus(_ context.Context, status *models.Tra
 
 	// Try to read existing
 	rec, err := s.client.Get(nil, key)
-	if err != nil {
+	if err != nil && !isKeyNotFound(err) {
 		return nil, false, fmt.Errorf("get status: %w", err)
 	}
 	if rec != nil {
@@ -104,7 +120,7 @@ func (s *AerospikeStore) GetOrInsertStatus(_ context.Context, status *models.Tra
 	if err := s.client.Put(policy, key, bins); err != nil {
 		// Race condition: someone else inserted — re-read
 		rec, getErr := s.client.Get(nil, key)
-		if getErr != nil {
+		if getErr != nil && !isKeyNotFound(getErr) {
 			return nil, false, fmt.Errorf("re-read after conflict: %w", getErr)
 		}
 		if rec != nil {
@@ -151,7 +167,7 @@ func (s *AerospikeStore) GetStatus(_ context.Context, txid string) (*models.Tran
 	}
 
 	rec, err := s.client.Get(nil, key)
-	if err != nil {
+	if err != nil && !isKeyNotFound(err) {
 		return nil, fmt.Errorf("get status %s: %w", txid, err)
 	}
 	if rec == nil {
@@ -272,7 +288,7 @@ func (s *AerospikeStore) GetBUMP(_ context.Context, blockHash string) (uint64, [
 		return 0, nil, err
 	}
 	rec, err := s.client.Get(nil, key)
-	if err != nil {
+	if err != nil && !isKeyNotFound(err) {
 		return 0, nil, fmt.Errorf("get bump %s: %w", blockHash, err)
 	}
 	if rec == nil {
@@ -452,7 +468,7 @@ func (s *AerospikeStore) IsBlockOnChain(_ context.Context, blockHash string) (bo
 		return false, err
 	}
 	rec, err := s.client.Get(nil, key, "on_chain")
-	if err != nil {
+	if err != nil && !isKeyNotFound(err) {
 		return false, err
 	}
 	if rec == nil {

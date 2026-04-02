@@ -1,40 +1,48 @@
 services:
-  kafka:
-    image: confluentinc/cp-kafka:7.6.0
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LOG_DIRS: /tmp/kraft-logs
-      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
-    ports:
-      - "9092:9092"
-
   aerospike:
-    image: aerospike/aerospike-server:7.1.0.0
+    image: docker.io/aerospike/aerospike-server:latest
     ports:
-      - "3000:3000"
+      - "3200:3000"
+      - "3201:3001"
+      - "3202:3002"
     volumes:
-      - aerospike-data:/opt/aerospike/data
+      - aerospike-data:/opt/aerospike/data:Z
+      - ./aerospike.conf:/opt/aerospike/etc/aerospike.conf:Z
+    command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
+    networks:
+      - arcade-net
 
-  arcade:
-    build: .
-    depends_on:
-      - kafka
-      - aerospike
+  zookeeper:
+    image: docker.io/confluentinc/cp-zookeeper:7.6.0
     environment:
-      ARCADE_MODE: all
-      ARCADE_KAFKA_BROKERS: kafka:9092
-      ARCADE_AEROSPIKE_HOSTS: aerospike:3000
-      ARCADE_API_PORT: "8080"
-      ARCADE_LOG_LEVEL: info
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
     ports:
-      - "8080:8080"
-      - "8081:8081"
+      - "2181:2181"
+    networks:
+      - arcade-net
+
+  kafka:
+    image: docker.io/confluentinc/cp-kafka:7.6.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9492:9492"
+    environment:
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9492"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9492"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - arcade-net
+
+networks:
+  arcade-net:
+    driver: bridge
 
 volumes:
   aerospike-data:

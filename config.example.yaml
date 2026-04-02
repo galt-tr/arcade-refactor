@@ -1,0 +1,47 @@
+# Arcade configuration
+# Copy to config.yaml and adjust for your environment.
+# All values can be overridden with ARCADE_ prefixed env vars
+# (e.g. ARCADE_LOG_LEVEL, ARCADE_KAFKA_BROKERS).
+
+# Service mode: all, api-server, p2p-client, block-processor, bump-builder, tx-validator, propagation
+mode: all
+
+log_level: info
+
+# callback_url: "https://example.com/callback"
+# callback_token: "your-callback-token"
+
+api:
+  host: 0.0.0.0
+  port: 8080
+
+kafka:
+  brokers:
+    - localhost:9092
+  consumer_group: arcade
+  max_retries: 5
+  buffer_size: 10000
+
+aerospike:
+  hosts:
+    - localhost:3200
+  namespace: arcade
+  batch_size: 500
+  pool_size: 256
+
+# datahub_urls:
+#   - "https://datahub1.example.com"
+#   - "https://datahub2.example.com"
+
+teranode:
+  auth_token: ""
+
+merkle_service:
+  url: ""
+  auth_token: ""
+
+p2p:
+  seeds: []
+
+health:
+  port: 8081

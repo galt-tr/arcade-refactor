@@ -1,5 +1,4 @@
 // Package validator provides transaction validation functionality.
-// Ported from the reference arcade implementation, adapted for go-sdk v1.1.22 API.
 package validator
 
 import (
