@@ -135,12 +135,14 @@ func (v *Validator) handleNewTransaction(ctx context.Context, msg txMessage) err
 	if v.txValidator != nil {
 		if valErr := v.txValidator.ValidateTransaction(ctx, tx, true, true); valErr != nil {
 			logger.Info("transaction validation failed", zap.Error(valErr))
-			v.store.UpdateStatus(ctx, &models.TransactionStatus{
+			if err := v.store.UpdateStatus(ctx, &models.TransactionStatus{
 				TxID:      txid,
 				Status:    models.StatusRejected,
 				ExtraInfo: valErr.Error(),
 				Timestamp: time.Now(),
-			})
+			}); err != nil {
+				logger.Error("failed to update rejected status", zap.Error(err))
+			}
 			return nil // Don't retry — validation failure is permanent
 		}
 	}

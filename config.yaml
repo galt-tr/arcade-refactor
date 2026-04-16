@@ -31,6 +31,7 @@ aerospike:
 
 datahub_urls:
   - "https://teranode-eks-ttn-eu-1.bsvb.tech/api/v1"
+#  - "https://teratestnet.icellan.net/api/v1"
 
 teranode:
   auth_token: ""

@@ -166,6 +166,8 @@ func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *sarama.Consum
 			lastErr = err
 			c.logger.Warn("message processing failed, retrying",
 				zap.String("topic", msg.Topic),
+				zap.Int32("partition", msg.Partition),
+				zap.Int64("offset", msg.Offset),
 				zap.Int("attempt", attempt+1),
 				zap.Error(err),
 			)
@@ -208,6 +210,8 @@ func (c *ConsumerGroup) sendToDLQ(msg *sarama.ConsumerMessage, processErr error)
 		c.logger.Info("message sent to DLQ",
 			zap.String("dlq_topic", dlqTopic),
 			zap.String("original_topic", msg.Topic),
+			zap.Int32("partition", msg.Partition),
+			zap.Int64("offset", msg.Offset),
 		)
 	}
 }

@@ -180,7 +180,9 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 				BlockHash: msg.BlockHash,
 				Timestamp: now,
 			}
-			s.store.UpdateStatus(ctx, status)
+			if err := s.store.UpdateStatus(ctx, status); err != nil {
+				logger.Warn("failed to update stump_processing status", zap.String("txid", txid), zap.Error(err))
+			}
 			s.txTracker.UpdateStatus(txid, models.StatusStumpProcessing)
 		}
 	}
@@ -197,7 +199,9 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 	}
 
 	// Publish to Kafka for downstream processing
-	s.producer.Send(kafka.TopicStump, msg.BlockHash, msg)
+	if err := s.producer.Send(kafka.TopicStump, msg.BlockHash, msg); err != nil {
+		logger.Error("failed to publish STUMP to kafka", zap.Error(err))
+	}
 }
 
 func (s *Server) handleBlockProcessed(msg models.CallbackMessage, logger *zap.Logger) {

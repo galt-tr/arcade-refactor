@@ -73,6 +73,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	var merkleClient *merkleservice.Client
 	if cfg.MerkleService.URL != "" {
 		merkleClient = merkleservice.NewClient(cfg.MerkleService.URL, cfg.MerkleService.AuthToken, 0)
+		merkleClient.SetLogger(logger.Named("merkle-client"))
 	}
 
 	txVal := validator.NewValidator(nil, nil) // Default policy, no chain tracker yet

@@ -126,10 +126,12 @@ func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage
 	logger.Info("building compound BUMP", zap.Int("stump_count", len(stumps)))
 
 	// 2. Fetch subtree hashes + coinbase BUMP from datahub
+	logger.Debug("fetching block data from datahub", zap.Strings("datahub_urls", b.cfg.DatahubURLs))
 	subtreeHashes, coinbaseBUMP, err := bump.FetchBlockDataForBUMP(ctx, b.cfg.DatahubURLs, blockHash)
 	if err != nil {
 		return fmt.Errorf("fetching block data: %w", err)
 	}
+	logger.Debug("datahub fetch succeeded", zap.Int("subtree_count", len(subtreeHashes)), zap.Bool("has_coinbase_bump", coinbaseBUMP != nil))
 
 	if len(subtreeHashes) == 0 {
 		logger.Warn("block has no subtrees, cannot construct BUMPs")

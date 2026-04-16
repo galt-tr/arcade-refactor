@@ -1,6 +1,7 @@
 package bump_builder
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -12,8 +13,11 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -134,18 +138,77 @@ func makeBlockProcessedMsg(blockHash string) *sarama.ConsumerMessage {
 	}
 }
 
-// newDatahubServer creates a test HTTP server that serves block data for BUMP construction.
-// Returns subtree hashes as a JSON response.
+// newDatahubServer creates a test HTTP server that serves binary block data for BUMP construction.
+// Binary format: header (80) | txCount (varint) | sizeBytes (varint) |
+// subtreeCount (varint) | subtreeHashes (N×32) | coinbaseTx (variable) |
+// blockHeight (varint) | coinbaseBUMPLen (varint)
 func newDatahubServer(subtreeHexHashes []string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := struct {
-			Subtrees     []string `json:"subtrees"`
-			CoinbaseBump string   `json:"coinbase_bump"`
-		}{
-			Subtrees: subtreeHexHashes,
+		var buf bytes.Buffer
+
+		// Block header (80 zero bytes)
+		buf.Write(make([]byte, 80))
+
+		// Transaction count (varint: 1)
+		buf.WriteByte(0x01)
+
+		// Size in bytes (varint: 0 — not used by parser)
+		buf.WriteByte(0x00)
+
+		// Subtree count (varint)
+		buf.Write(transaction.VarInt(len(subtreeHexHashes)).Bytes())
+
+		// Subtree hashes (32 bytes each)
+		for _, hexHash := range subtreeHexHashes {
+			hashBytes, _ := hex.DecodeString(hexHash)
+			padded := make([]byte, 32)
+			copy(padded, hashBytes)
+			buf.Write(padded)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+
+		// Minimal coinbase transaction
+		coinbaseTx := transaction.NewTransaction()
+		buf.Write(coinbaseTx.Bytes())
+
+		// Block height (varint: 1)
+		buf.WriteByte(0x01)
+
+		// Coinbase BUMP length (varint: 0 = no BUMP)
+		buf.WriteByte(0x00)
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(buf.Bytes())
+	}))
+}
+
+// newDatahubServerWithCoinbaseBUMP creates a test server that includes coinbase BUMP data.
+func newDatahubServerWithCoinbaseBUMP(subtreeHexHashes []string, coinbaseBUMP []byte) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+
+		buf.Write(make([]byte, 80))       // header
+		buf.WriteByte(0x01)               // txCount
+		buf.WriteByte(0x00)               // sizeBytes
+		buf.Write(transaction.VarInt(len(subtreeHexHashes)).Bytes()) // subtreeCount
+
+		for _, hexHash := range subtreeHexHashes {
+			hashBytes, _ := hex.DecodeString(hexHash)
+			padded := make([]byte, 32)
+			copy(padded, hashBytes)
+			buf.Write(padded)
+		}
+
+		coinbaseTx := transaction.NewTransaction()
+		buf.Write(coinbaseTx.Bytes())
+
+		buf.WriteByte(0x01) // blockHeight
+
+		// Coinbase BUMP length + data
+		buf.Write(transaction.VarInt(len(coinbaseBUMP)).Bytes())
+		buf.Write(coinbaseBUMP)
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(buf.Bytes())
 	}))
 }
 
@@ -554,6 +617,61 @@ func TestStumpConsumer_HandleMessage_MissingFields_ReturnsError(t *testing.T) {
 				t.Error("expected error for missing fields")
 			}
 		})
+	}
+}
+
+func TestBuilder_E2E_BUMPExtractionWithRealisticSTUMP(t *testing.T) {
+	// This test uses realistic STUMPs (built via go-sdk types) to verify
+	// the full flow: store STUMPs → build BUMP → extract per-tx path.
+	// The bump/bump_test.go suite covers ExtractMinimalPathForTx exhaustively;
+	// this test verifies the builder stores data that extraction can consume.
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+
+	// Build a realistic STUMP with 2 leaves using go-sdk types
+	txHash1Bytes, _ := hex.DecodeString("1111111111111111111111111111111111111111111111111111111111111111")
+	txHash2Bytes, _ := hex.DecodeString("2222222222222222222222222222222222222222222222222222222222222222")
+	h1, _ := chainhash.NewHash(txHash1Bytes)
+	h2, _ := chainhash.NewHash(txHash2Bytes)
+
+	isTxid := true
+	isNotTxid := false
+	stumpMP := transaction.NewMerklePath(1, [][]*transaction.PathElement{
+		{
+			{Offset: 0, Hash: h1, Txid: &isTxid},
+			{Offset: 1, Hash: h2, Txid: &isNotTxid},
+		},
+	})
+	stumpData := stumpMP.Bytes()
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHash := "3333333333333333333333333333333333333333333333333333333333333333"
+	datahub := newDatahubServer([]string{subtreeHash})
+	defer datahub.Close()
+
+	tracker := store.NewTxTracker()
+	tracker.AddHash(*h1, models.StatusSeenOnNetwork)
+
+	b := newTestBuilder(ms, datahub.URL, tracker)
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("handleMessage failed: %v", err)
+	}
+
+	ms.mu.Lock()
+	bumpData, ok := ms.bumps[blockHash]
+	ms.mu.Unlock()
+	if !ok || len(bumpData) == 0 {
+		t.Fatal("expected non-empty BUMP data to be stored")
+	}
+
+	// Extract minimal path for the tracked txid
+	result := bump.ExtractMinimalPathForTx(bumpData, h1.String())
+	if result == nil {
+		t.Fatal("ExtractMinimalPathForTx returned nil for tracked txid")
+	}
+	if len(result) == 0 {
+		t.Fatal("ExtractMinimalPathForTx returned empty bytes")
 	}
 }
 

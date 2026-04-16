@@ -252,6 +252,41 @@ func ExtractMinimalPath(fullPath *transaction.MerklePath, txOffset uint64) *tran
 	return mp
 }
 
+// ExtractMinimalPathForTx extracts a per-tx minimal merkle path from a compound BUMP.
+// It parses the compound BUMP from binary, finds the txid at level 0, and extracts
+// the minimal BRC-74 path needed to verify that specific transaction.
+// Returns nil if the txid is not found or the input is invalid.
+func ExtractMinimalPathForTx(bumpData []byte, txid string) []byte {
+	compound, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		return nil
+	}
+
+	txHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+
+	// Find the tx at level 0
+	var txOffset uint64
+	found := false
+	if len(compound.Path) > 0 {
+		for _, leaf := range compound.Path[0] {
+			if leaf.Hash != nil && *leaf.Hash == *txHash {
+				txOffset = leaf.Offset
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		return nil
+	}
+
+	minimal := ExtractMinimalPath(compound, txOffset)
+	return minimal.Bytes()
+}
+
 // ExtractLevel0Hashes parses a BRC-74 STUMP binary and returns all level-0 hashes.
 func ExtractLevel0Hashes(stumpData []byte) []chainhash.Hash {
 	mp, err := transaction.NewMerklePathFromBinary(stumpData)

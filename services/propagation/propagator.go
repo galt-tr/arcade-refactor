@@ -182,6 +182,7 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 	}
 
 	type endpointResult struct {
+		endpoint   string
 		statusCode int
 		err        error
 	}
@@ -196,7 +197,7 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 		go func(ep string) {
 			defer wg.Done()
 			statusCode, err := p.teranodeClient.SubmitTransaction(submitCtx, ep, rawTx)
-			resultCh <- endpointResult{statusCode: statusCode, err: err}
+			resultCh <- endpointResult{endpoint: ep, statusCode: statusCode, err: err}
 		}(endpoint)
 	}
 
@@ -209,11 +210,21 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 	var bestStatus models.Status
 	for result := range resultCh {
 		if result.err != nil {
+			p.logger.Debug("single broadcast endpoint failed",
+				zap.String("txid", txid),
+				zap.String("endpoint", result.endpoint),
+				zap.Error(result.err),
+			)
 			if statusPriority(models.StatusRejected) > statusPriority(bestStatus) {
 				bestStatus = models.StatusRejected
 			}
 			continue
 		}
+		p.logger.Debug("single broadcast endpoint succeeded",
+			zap.String("txid", txid),
+			zap.String("endpoint", result.endpoint),
+			zap.Int("status_code", result.statusCode),
+		)
 		switch result.statusCode {
 		case http.StatusOK:
 			if statusPriority(models.StatusAcceptedByNetwork) > statusPriority(bestStatus) {
@@ -246,7 +257,8 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	}
 
 	type endpointResult struct {
-		err error
+		endpoint string
+		err      error
 	}
 
 	resultCh := make(chan endpointResult, len(endpoints))
@@ -259,7 +271,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		go func(ep string) {
 			defer wg.Done()
 			_, err := p.teranodeClient.SubmitTransactions(submitCtx, ep, rawTxs)
-			resultCh <- endpointResult{err: err}
+			resultCh <- endpointResult{endpoint: ep, err: err}
 		}(endpoint)
 	}
 
@@ -271,10 +283,26 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	// Binary outcome: any success → AcceptedByNetwork, all fail → Rejected
 	anySuccess := false
 	for result := range resultCh {
-		if result.err == nil {
+		if result.err != nil {
+			p.logger.Debug("batch broadcast endpoint failed",
+				zap.String("endpoint", result.endpoint),
+				zap.Int("batch_size", len(batch)),
+				zap.Error(result.err),
+			)
+		} else {
+			p.logger.Debug("batch broadcast endpoint succeeded",
+				zap.String("endpoint", result.endpoint),
+				zap.Int("batch_size", len(batch)),
+			)
 			anySuccess = true
 		}
 	}
+
+	p.logger.Debug("batch broadcast complete",
+		zap.Int("batch_size", len(batch)),
+		zap.Bool("any_success", anySuccess),
+		zap.Int("endpoint_count", len(endpoints)),
+	)
 
 	now := time.Now()
 	statuses := make([]*models.TransactionStatus, len(batch))

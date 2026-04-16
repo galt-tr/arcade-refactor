@@ -12,6 +12,9 @@ import (
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
+
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/models"
 )
@@ -190,7 +193,7 @@ func (s *AerospikeStore) UpdateStatus(_ context.Context, status *models.Transact
 	return s.client.Put(nil, key, bins)
 }
 
-func (s *AerospikeStore) GetStatus(_ context.Context, txid string) (*models.TransactionStatus, error) {
+func (s *AerospikeStore) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return nil, err
@@ -204,7 +207,9 @@ func (s *AerospikeStore) GetStatus(_ context.Context, txid string) (*models.Tran
 		return nil, nil
 	}
 
-	return recordToStatus(rec, txid), nil
+	status := recordToStatus(rec, txid)
+	s.enrichMerklePath(ctx, status)
+	return status, nil
 }
 
 func (s *AerospikeStore) GetStatusesSince(_ context.Context, _ time.Time) ([]*models.TransactionStatus, error) {
@@ -624,6 +629,74 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 		}
 	}
 	return status
+}
+
+// enrichMerklePath fetches the compound BUMP for a mined/immutable transaction
+// and extracts the per-tx minimal merkle path if not already present.
+func (s *AerospikeStore) enrichMerklePath(ctx context.Context, status *models.TransactionStatus) {
+	if status == nil || len(status.MerklePath) > 0 || status.BlockHash == "" {
+		return
+	}
+	if status.Status != models.StatusMined && status.Status != models.StatusImmutable {
+		return
+	}
+	_, bumpData, err := s.GetBUMP(ctx, status.BlockHash)
+	if err != nil || len(bumpData) == 0 {
+		return
+	}
+	status.MerklePath = extractMinimalPathForTx(bumpData, status.TxID)
+}
+
+// extractMinimalPathForTx extracts a per-tx minimal merkle path from a compound BUMP.
+func extractMinimalPathForTx(bumpData []byte, txid string) []byte {
+	compound, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		return nil
+	}
+	txHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+
+	var txOffset uint64
+	found := false
+	if len(compound.Path) > 0 {
+		for _, leaf := range compound.Path[0] {
+			if leaf.Hash != nil && *leaf.Hash == *txHash {
+				txOffset = leaf.Offset
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		return nil
+	}
+
+	mp := &transaction.MerklePath{
+		BlockHeight: compound.BlockHeight,
+		Path:        make([][]*transaction.PathElement, len(compound.Path)),
+	}
+	offset := txOffset
+	for level := 0; level < len(compound.Path); level++ {
+		if level == 0 {
+			for _, leaf := range compound.Path[level] {
+				if leaf.Offset == offset {
+					mp.Path[level] = append(mp.Path[level], leaf)
+					break
+				}
+			}
+		}
+		sibOffset := offset ^ 1
+		for _, leaf := range compound.Path[level] {
+			if leaf.Offset == sibOffset {
+				mp.Path[level] = append(mp.Path[level], leaf)
+				break
+			}
+		}
+		offset = offset >> 1
+	}
+	return mp.Bytes()
 }
 
 func recordToSubmission(rec *aero.Record) *models.Submission {

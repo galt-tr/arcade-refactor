@@ -1,131 +1,140 @@
 package bump
 
 import (
+	"bytes"
 	"context"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 )
 
 var httpClient = &http.Client{Timeout: 5 * time.Minute}
 
-// blockJSONResponse is the JSON format returned by the DataHub block endpoint.
-type blockJSONResponse struct {
-	Subtrees     []string `json:"subtrees"`
-	CoinbaseBump string   `json:"coinbase_bump"`
-}
-
-// FetchBlockDataForBUMP fetches subtree hashes and coinbase BUMP for a block,
-// trying all DataHub URLs. Prefers the JSON endpoint (which includes coinbase_bump),
-// falling back to the binary endpoint (no coinbase BUMP).
+// FetchBlockDataForBUMP fetches subtree hashes and coinbase BUMP for a block
+// from the binary block endpoint, trying all DataHub URLs.
+//
+// Binary format: header (80) | txCount (varint) | sizeBytes (varint) |
+// subtreeCount (varint) | subtreeHashes (N×32) | coinbaseTx (variable) |
+// blockHeight (varint) | coinbaseBUMPLen (varint) | coinbaseBUMP (variable)
 func FetchBlockDataForBUMP(ctx context.Context, datahubURLs []string, blockHash string) (subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, err error) {
-	for _, dataHubURL := range datahubURLs {
-		// Try JSON endpoint first (includes coinbase_bump)
-		resp, jsonErr := fetchBlockJSON(ctx, dataHubURL, blockHash)
-		if jsonErr == nil {
-			hashes, coinbase, parseErr := parseBlockJSONResponse(resp)
-			if parseErr == nil {
-				return hashes, coinbase, nil
-			}
+	var urlErrors []string
+	for i, dataHubURL := range datahubURLs {
+		hashes, cbBUMP, fetchErr := fetchBlockBinary(ctx, dataHubURL, blockHash)
+		if fetchErr == nil {
+			return hashes, cbBUMP, nil
 		}
-
-		// Fall back to binary endpoint (no coinbase BUMP)
-		hashes, binErr := fetchBlockBinarySubtrees(ctx, dataHubURL, blockHash)
-		if binErr == nil {
-			return hashes, nil, nil
-		}
+		urlErrors = append(urlErrors, fmt.Sprintf("url[%d] %q: %v", i, dataHubURL, fetchErr))
 	}
-	return nil, nil, fmt.Errorf("all DataHub URLs failed for block %s", blockHash)
+	return nil, nil, fmt.Errorf("all DataHub URLs failed for block %s:\n  %s", blockHash, strings.Join(urlErrors, "\n  "))
 }
 
-func fetchBlockJSON(ctx context.Context, baseURL, blockHash string) (*blockJSONResponse, error) {
-	url := fmt.Sprintf("%s/block/%s?format=json", baseURL, blockHash)
+// fetchBlockBinary fetches a block from the binary endpoint and parses
+// subtree hashes and coinbase BUMP from the response.
+func fetchBlockBinary(ctx context.Context, baseURL, blockHash string) ([]chainhash.Hash, []byte, error) {
+	url := fmt.Sprintf("%s/block/%s", baseURL, blockHash)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, nil, fmt.Errorf("GET %s: status %d (body: %s)", url, resp.StatusCode, string(body))
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Read entire response into memory so we can use NewTransactionFromStream
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	var result blockJSONResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-
-	return &result, nil
+	return parseBlockBinary(data)
 }
 
-func fetchBlockBinarySubtrees(ctx context.Context, baseURL, blockHash string) ([]chainhash.Hash, error) {
-	url := fmt.Sprintf("%s/block/%s/subtrees", baseURL, blockHash)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
+// parseBlockBinary parses the binary block format:
+// header (80) | txCount (varint) | sizeBytes (varint) |
+// subtreeCount (varint) | subtreeHashes (N×32) | coinbaseTx (variable) |
+// blockHeight (varint) | coinbaseBUMPLen (varint) | coinbaseBUMP (variable)
+func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, error) {
+	if len(data) < 80 {
+		return nil, nil, fmt.Errorf("block data too short for header: %d bytes", len(data))
 	}
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	r := bytes.NewReader(data[80:]) // skip block header
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	// Read transaction count (varint)
+	var txCount transaction.VarInt
+	if _, err := txCount.ReadFrom(r); err != nil {
+		return nil, nil, fmt.Errorf("failed to read transaction count: %w", err)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	// Read size in bytes (varint)
+	var sizeBytes transaction.VarInt
+	if _, err := sizeBytes.ReadFrom(r); err != nil {
+		return nil, nil, fmt.Errorf("failed to read size in bytes: %w", err)
 	}
 
-	// Binary format: concatenated 32-byte hashes
-	if len(body)%32 != 0 {
-		return nil, fmt.Errorf("invalid binary subtree data: %d bytes", len(body))
+	// Read subtree count (varint)
+	var subtreeCount transaction.VarInt
+	if _, err := subtreeCount.ReadFrom(r); err != nil {
+		return nil, nil, fmt.Errorf("failed to read subtree count: %w", err)
 	}
 
-	hashes := make([]chainhash.Hash, len(body)/32)
-	for i := range hashes {
-		copy(hashes[i][:], body[i*32:(i+1)*32])
-	}
-
-	return hashes, nil
-}
-
-// parseBlockJSONResponse converts a blockJSONResponse into typed data.
-func parseBlockJSONResponse(resp *blockJSONResponse) ([]chainhash.Hash, []byte, error) {
-	hashes := make([]chainhash.Hash, 0, len(resp.Subtrees))
-	for _, hexStr := range resp.Subtrees {
-		h, err := chainhash.NewHashFromHex(hexStr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to parse subtree hash %q: %w", hexStr, err)
+	// Read subtree hashes (32 bytes each)
+	hashes := make([]chainhash.Hash, 0, uint64(subtreeCount))
+	hashBuf := make([]byte, 32)
+	for i := uint64(0); i < uint64(subtreeCount); i++ {
+		if _, err := io.ReadFull(r, hashBuf); err != nil {
+			return nil, nil, fmt.Errorf("failed to read subtree hash %d: %w", i, err)
 		}
-		hashes = append(hashes, *h)
+		hash, err := chainhash.NewHash(hashBuf)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create hash: %w", err)
+		}
+		hashes = append(hashes, *hash)
 	}
 
-	var coinbaseBUMP []byte
-	if resp.CoinbaseBump != "" {
-		var err error
-		coinbaseBUMP, err = hex.DecodeString(resp.CoinbaseBump)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to decode coinbase_bump: %w", err)
-		}
+	// Parse coinbase transaction (variable length) to skip past it
+	remaining := data[len(data)-r.Len():]
+	_, txBytesUsed, err := transaction.NewTransactionFromStream(remaining)
+	if err != nil {
+		// Coinbase tx parsing failed — return subtree hashes without coinbase BUMP
+		return hashes, nil, nil
+	}
+
+	r = bytes.NewReader(remaining[txBytesUsed:])
+
+	// Read block height (varint)
+	var blockHeight transaction.VarInt
+	if _, err := blockHeight.ReadFrom(r); err != nil {
+		return hashes, nil, nil
+	}
+
+	// Read coinbase BUMP length (varint)
+	var cbBUMPLen transaction.VarInt
+	if _, err := cbBUMPLen.ReadFrom(r); err != nil {
+		return hashes, nil, nil
+	}
+
+	if uint64(cbBUMPLen) == 0 {
+		return hashes, nil, nil
+	}
+
+	// Read coinbase BUMP data
+	coinbaseBUMP := make([]byte, uint64(cbBUMPLen))
+	if _, err := io.ReadFull(r, coinbaseBUMP); err != nil {
+		return hashes, nil, nil
 	}
 
 	return hashes, coinbaseBUMP, nil

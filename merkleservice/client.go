@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -20,6 +22,7 @@ type Client struct {
 	baseURL    string
 	authToken  string
 	httpClient *http.Client
+	logger     *zap.Logger
 }
 
 // NewClient creates a new Merkle Service client
@@ -34,6 +37,11 @@ func NewClient(baseURL, authToken string, timeout time.Duration) *Client {
 			Timeout: timeout,
 		},
 	}
+}
+
+// SetLogger sets an optional logger for debug-level HTTP tracing.
+func (c *Client) SetLogger(logger *zap.Logger) {
+	c.logger = logger
 }
 
 // watchRequest is the payload sent to POST /watch
@@ -73,7 +81,17 @@ func (c *Client) Register(ctx context.Context, txid, callbackURL string) error {
 	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("merkle service returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		err := fmt.Errorf("POST %s: merkle service returned status %d (body: %s)", url, resp.StatusCode, string(body))
+		if c.logger != nil {
+			c.logger.Debug("merkle service registration failed",
+				zap.String("url", url),
+				zap.String("txid", txid),
+				zap.Int("status_code", resp.StatusCode),
+				zap.String("response_body", string(body)),
+			)
+		}
+		return err
 	}
 
 	return nil
