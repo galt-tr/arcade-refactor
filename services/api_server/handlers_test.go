@@ -102,8 +102,12 @@ func (m *mockStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stu
 	return nil, nil
 }
 func (m *mockStore) DeleteStumpsByBlockHash(context.Context, string) error { return nil }
-func (m *mockStore) EnsureIndexes() error                                  { return nil }
-func (m *mockStore) Close() error                                         { return nil }
+func (m *mockStore) IncrementRetryCount(context.Context, string) (int, error) { return 0, nil }
+func (m *mockStore) GetPendingRetryTxs(context.Context) ([]*models.TransactionStatus, error) {
+	return nil, nil
+}
+func (m *mockStore) EnsureIndexes() error { return nil }
+func (m *mockStore) Close() error         { return nil }
 
 func makeMinimalTx() []byte {
 	tx := sdkTx.NewTransaction()

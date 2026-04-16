@@ -69,6 +69,8 @@ const (
 	StatusDoubleSpendAttempted = Status("DOUBLE_SPEND_ATTEMPTED")
 	// StatusRejected indicates the transaction was rejected.
 	StatusRejected = Status("REJECTED")
+	// StatusPendingRetry indicates the transaction broadcast failed with a retryable error and will be retried.
+	StatusPendingRetry = Status("PENDING_RETRY")
 	// StatusStumpProcessing indicates the transaction has a STUMP and is building the BUMP
 	StatusStumpProcessing = Status("STUMP_PROCESSING")
 	// StatusMined indicates the transaction was mined.
@@ -84,7 +86,7 @@ func (s Status) DisallowedPreviousStatuses() []Status {
 	case StatusUnknown, StatusReceived:
 		return []Status{}
 	case StatusSentToNetwork:
-		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
+		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusPendingRetry, StatusDoubleSpendAttempted, StatusMined}
 	case StatusAcceptedByNetwork:
 		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
 	case StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable:

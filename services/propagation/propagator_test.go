@@ -57,8 +57,14 @@ func (e *eventLog) count(prefix string) int {
 // mockStore implements store.Store with only UpdateStatus having real logic.
 type mockStore struct {
 	store.Store // embed interface — all unimplemented methods panic if called
-	mu          sync.Mutex
-	updates     []*models.TransactionStatus
+	mu             sync.Mutex
+	updates        []*models.TransactionStatus
+	retryCounts    map[string]int
+	pendingRetries []*models.TransactionStatus
+}
+
+func newMockStore() *mockStore {
+	return &mockStore{retryCounts: make(map[string]int)}
 }
 
 func (m *mockStore) EnsureIndexes() error { return nil }
@@ -70,10 +76,46 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 	return nil
 }
 
+func (m *mockStore) IncrementRetryCount(_ context.Context, txid string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retryCounts[txid]++
+	return m.retryCounts[txid], nil
+}
+
+func (m *mockStore) GetPendingRetryTxs(_ context.Context) ([]*models.TransactionStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pendingRetries, nil
+}
+
 func (m *mockStore) updateCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.updates)
+}
+
+func (m *mockStore) updatesForTxid(txid string) []*models.TransactionStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []*models.TransactionStatus
+	for _, u := range m.updates {
+		if u.TxID == txid {
+			result = append(result, u)
+		}
+	}
+	return result
+}
+
+func (m *mockStore) lastUpdateForTxid(txid string) *models.TransactionStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.updates) - 1; i >= 0; i-- {
+		if m.updates[i].TxID == txid {
+			return m.updates[i]
+		}
+	}
+	return nil
 }
 
 // helpers
@@ -141,7 +183,7 @@ func handleAndFlush(t *testing.T, p *Propagator, payload []byte) error {
 // Test 1: Registration happens before broadcast on success (single message)
 func TestHandleMessage_RegistrationBeforeBroadcast(t *testing.T) {
 	log := &eventLog{}
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
@@ -181,7 +223,7 @@ func TestHandleMessage_RegistrationBeforeBroadcast(t *testing.T) {
 // Test 2: Merkle failure returns error and prevents broadcast
 func TestHandleMessage_MerkleFailure_NoBroadcast(t *testing.T) {
 	log := &eventLog{}
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	merkleSrv := newMerkleServer(log, http.StatusInternalServerError)
 	defer merkleSrv.Close()
@@ -210,7 +252,7 @@ func TestHandleMessage_MerkleFailure_NoBroadcast(t *testing.T) {
 // Test 3: Merkle timeout returns error and prevents broadcast
 func TestHandleMessage_MerkleTimeout_NoBroadcast(t *testing.T) {
 	log := &eventLog{}
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	done := make(chan struct{})
 	merkleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +286,7 @@ func TestHandleMessage_MerkleTimeout_NoBroadcast(t *testing.T) {
 // Test 4: Batch — all 5 messages registered then broadcast in single call
 func TestHandleMessage_BatchAllRegistered(t *testing.T) {
 	log := &eventLog{}
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
@@ -283,7 +325,7 @@ func TestHandleMessage_BatchAllRegistered(t *testing.T) {
 // Test 5: No merkle client — registration skipped, broadcast proceeds
 func TestHandleMessage_NoMerkleClient_SkipsRegistration(t *testing.T) {
 	log := &eventLog{}
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
@@ -313,7 +355,7 @@ func TestHandleMessage_NoMerkleClient_SkipsRegistration(t *testing.T) {
 // Test 6: No callback URL — registration skipped, broadcast proceeds
 func TestHandleMessage_NoCallbackURL_SkipsRegistration(t *testing.T) {
 	log := &eventLog{}
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
@@ -361,7 +403,7 @@ func TestProcessBatch_100Transactions(t *testing.T) {
 	}))
 	defer teranodeSrv.Close()
 
-	ms := &mockStore{}
+	ms := newMockStore()
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
 	// Accumulate 100 messages
@@ -401,7 +443,7 @@ func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 	}))
 	defer teranodeSrv.Close()
 
-	ms := &mockStore{}
+	ms := newMockStore()
 	p := newPropagator(merkleSrv.URL, teranodeSrv.URL, ms)
 
 	for i := 0; i < 5; i++ {
@@ -424,7 +466,7 @@ func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 // Test 9: Nil merkle client skips registration for batch
 func TestProcessBatch_NilMerkleClient_SkipsRegistration(t *testing.T) {
 	log := &eventLog{}
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	merkleSrv := newMerkleServer(log, http.StatusOK)
 	defer merkleSrv.Close()
@@ -454,7 +496,7 @@ func TestProcessBatch_NilMerkleClient_SkipsRegistration(t *testing.T) {
 // Test 10: Single transaction uses /tx endpoint, not /txs
 func TestSingleTransaction_UsesTxEndpoint(t *testing.T) {
 	log := &eventLog{}
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	teranodeSrv := newTeranodeServer(log, http.StatusOK)
 	defer teranodeSrv.Close()
@@ -477,7 +519,7 @@ func TestSingleTransaction_UsesTxEndpoint(t *testing.T) {
 // Test 11: Batch transactions use /txs endpoint, not /tx
 func TestBatchTransactions_UsesTxsEndpoint(t *testing.T) {
 	log := &eventLog{}
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	teranodeSrv := newTeranodeServer(log, http.StatusOK)
 	defer teranodeSrv.Close()
@@ -506,7 +548,7 @@ func TestBatchTransactions_UsesTxsEndpoint(t *testing.T) {
 
 // Test 12: Single transaction 200 → AcceptedByNetwork
 func TestSingleTransaction_Status200_AcceptedByNetwork(t *testing.T) {
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
 	defer teranodeSrv.Close()
@@ -530,7 +572,7 @@ func TestSingleTransaction_Status200_AcceptedByNetwork(t *testing.T) {
 
 // Test 13: Single transaction 202 → no status update (matching original behavior)
 func TestSingleTransaction_Status202_NoStatusUpdate(t *testing.T) {
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
@@ -551,7 +593,7 @@ func TestSingleTransaction_Status202_NoStatusUpdate(t *testing.T) {
 
 // Test 14: Batch — any endpoint success → AcceptedByNetwork for all
 func TestBatchTransactions_AnySuccess_AcceptedByNetwork(t *testing.T) {
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	// First endpoint fails, second succeeds
 	callCount := atomic.Int32{}
@@ -593,7 +635,7 @@ func TestBatchTransactions_AnySuccess_AcceptedByNetwork(t *testing.T) {
 
 // Test 15: Batch — all endpoints fail → Rejected for all
 func TestBatchTransactions_AllFail_Rejected(t *testing.T) {
-	ms := &mockStore{}
+	ms := newMockStore()
 
 	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -619,6 +661,276 @@ func TestBatchTransactions_AllFail_Rejected(t *testing.T) {
 		if u.Status != models.StatusRejected {
 			t.Errorf("tx %d: expected Rejected, got %s", i, u.Status)
 		}
+	}
+}
+
+// --- Retry Tests ---
+
+// newTeranodeServerWithError returns a server that fails with a specific error message
+func newTeranodeServerWithError(errMsg string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(errMsg))
+	}))
+}
+
+// newTeranodeServerToggle fails N times with errMsg, then succeeds
+func newTeranodeServerToggle(failCount *atomic.Int32, maxFails int32, errMsg string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := failCount.Add(1)
+		if n <= maxFails {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(errMsg))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+}
+
+// Test 16: Missing inputs → PENDING_RETRY → retry succeeds → ACCEPTED_BY_NETWORK
+func TestRetry_MissingInputs_ThenSuccess(t *testing.T) {
+	ms := newMockStore()
+	failCount := &atomic.Int32{}
+
+	// Fail first call with "missing inputs", succeed on second
+	teranodeSrv := newTeranodeServerToggle(failCount, 1, "missing inputs for tx")
+	defer teranodeSrv.Close()
+
+	p := newPropagator("", teranodeSrv.URL, ms)
+
+	// First flush: broadcast fails with retryable error → PENDING_RETRY
+	err := handleAndFlush(t, p, makePropMsg("tx-retry"))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Verify PENDING_RETRY status was set
+	pendingUpdate := ms.lastUpdateForTxid("tx-retry")
+	if pendingUpdate == nil {
+		t.Fatal("expected status update for tx-retry")
+	}
+	if pendingUpdate.Status != models.StatusPendingRetry {
+		t.Fatalf("expected PENDING_RETRY, got %s", pendingUpdate.Status)
+	}
+
+	// Verify tx is in retry buffer
+	if p.retryBuf.Len() != 1 {
+		t.Fatalf("expected 1 entry in retry buffer, got %d", p.retryBuf.Len())
+	}
+
+	// Manually set retry entry to be ready now
+	ready := p.retryBuf.Ready()
+	if len(ready) == 0 {
+		// Force the entry to be ready by updating its NextRetry
+		p.retryBuf.mu.Lock()
+		for _, e := range p.retryBuf.entries {
+			e.NextRetry = time.Now().Add(-1 * time.Second)
+		}
+		p.retryBuf.mu.Unlock()
+	}
+
+	// Second flush: retry succeeds → ACCEPTED_BY_NETWORK
+	if err := p.flushBatch(); err != nil {
+		t.Fatalf("second flush error: %v", err)
+	}
+
+	lastUpdate := ms.lastUpdateForTxid("tx-retry")
+	if lastUpdate == nil || lastUpdate.Status != models.StatusAcceptedByNetwork {
+		t.Fatalf("expected ACCEPTED_BY_NETWORK after retry, got %v", lastUpdate)
+	}
+
+	if p.retryBuf.Len() != 0 {
+		t.Fatalf("expected empty retry buffer after success, got %d", p.retryBuf.Len())
+	}
+}
+
+// Test 17: Missing inputs repeatedly → retries exhausted → REJECTED
+func TestRetry_MissingInputs_RetriesExhausted(t *testing.T) {
+	ms := newMockStore()
+
+	// Always fail with "missing inputs"
+	teranodeSrv := newTeranodeServerWithError("missing inputs for tx")
+	defer teranodeSrv.Close()
+
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	cfg.Propagation.RetryMaxAttempts = 3
+	cfg.Propagation.RetryBackoffMs = 1 // 1ms for fast test
+	cfg.Propagation.RetryBufferSize = 100
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "")
+	p := New(cfg, zap.NewNop(), nil, ms, tc, nil)
+
+	// Initial broadcast → PENDING_RETRY
+	err := handleAndFlush(t, p, makePropMsg("tx-exhaust"))
+	if err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	// Retry until exhausted
+	for i := 0; i < 10; i++ {
+		// Force entries to be ready
+		p.retryBuf.mu.Lock()
+		for _, e := range p.retryBuf.entries {
+			e.NextRetry = time.Now().Add(-1 * time.Second)
+		}
+		p.retryBuf.mu.Unlock()
+
+		if err := p.flushBatch(); err != nil {
+			t.Fatalf("flush %d error: %v", i, err)
+		}
+		if p.retryBuf.Len() == 0 {
+			break
+		}
+	}
+
+	if p.retryBuf.Len() != 0 {
+		t.Fatalf("expected empty buffer after exhaustion, got %d", p.retryBuf.Len())
+	}
+
+	lastUpdate := ms.lastUpdateForTxid("tx-exhaust")
+	if lastUpdate == nil {
+		t.Fatal("expected final status update")
+	}
+	if lastUpdate.Status != models.StatusRejected {
+		t.Fatalf("expected REJECTED after retries exhausted, got %s", lastUpdate.Status)
+	}
+	if !strings.Contains(lastUpdate.ExtraInfo, "broadcast retries exhausted") {
+		t.Fatalf("expected 'broadcast retries exhausted' in ExtraInfo, got %q", lastUpdate.ExtraInfo)
+	}
+}
+
+// Test 18: Permanent error → immediate REJECTED (no retry)
+func TestRetry_PermanentError_ImmediateReject(t *testing.T) {
+	ms := newMockStore()
+
+	teranodeSrv := newTeranodeServerWithError("bad-txns-vin-empty")
+	defer teranodeSrv.Close()
+
+	p := newPropagator("", teranodeSrv.URL, ms)
+
+	err := handleAndFlush(t, p, makePropMsg("tx-perm"))
+	if err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	// Should be immediately rejected, not in retry buffer
+	if p.retryBuf.Len() != 0 {
+		t.Fatalf("expected empty retry buffer for permanent error, got %d", p.retryBuf.Len())
+	}
+
+	lastUpdate := ms.lastUpdateForTxid("tx-perm")
+	if lastUpdate == nil {
+		t.Fatal("expected status update")
+	}
+	if lastUpdate.Status != models.StatusRejected {
+		t.Fatalf("expected REJECTED, got %s", lastUpdate.Status)
+	}
+}
+
+// Test 19: Retry buffer full → immediate REJECTED
+func TestRetry_BufferFull_ImmediateReject(t *testing.T) {
+	ms := newMockStore()
+
+	teranodeSrv := newTeranodeServerWithError("missing inputs for tx")
+	defer teranodeSrv.Close()
+
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	cfg.Propagation.RetryMaxAttempts = 5
+	cfg.Propagation.RetryBackoffMs = 500
+	cfg.Propagation.RetryBufferSize = 1 // buffer size of 1
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "")
+	p := New(cfg, zap.NewNop(), nil, ms, tc, nil)
+
+	// First tx fills the buffer
+	err := handleAndFlush(t, p, makePropMsg("tx-fill"))
+	if err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+	if p.retryBuf.Len() != 1 {
+		t.Fatalf("expected 1 entry in buffer, got %d", p.retryBuf.Len())
+	}
+
+	// Second tx: buffer full → immediate reject
+	err = handleAndFlush(t, p, makePropMsg("tx-overflow"))
+	if err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	lastUpdate := ms.lastUpdateForTxid("tx-overflow")
+	if lastUpdate == nil {
+		t.Fatal("expected status update for tx-overflow")
+	}
+	if lastUpdate.Status != models.StatusRejected {
+		t.Fatalf("expected REJECTED for overflow tx, got %s", lastUpdate.Status)
+	}
+	if !strings.Contains(lastUpdate.ExtraInfo, "retry buffer full") {
+		t.Fatalf("expected 'retry buffer full' in ExtraInfo, got %q", lastUpdate.ExtraInfo)
+	}
+}
+
+// Test 20: Startup recovery rejects stale PENDING_RETRY transactions
+func TestStartupRecovery_RejectsStaleRetries(t *testing.T) {
+	ms := newMockStore()
+	ms.pendingRetries = []*models.TransactionStatus{
+		{TxID: "stale-tx-1", Status: models.StatusPendingRetry},
+		{TxID: "stale-tx-2", Status: models.StatusPendingRetry},
+	}
+
+	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	cfg.Propagation.RetryMaxAttempts = 5
+	cfg.Propagation.RetryBackoffMs = 500
+	cfg.Propagation.RetryBufferSize = 100
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "")
+	p := New(cfg, zap.NewNop(), nil, ms, tc, nil)
+
+	// Simulate startup recovery
+	p.recoverPendingRetries(context.Background())
+
+	// Both should be rejected
+	for _, txid := range []string{"stale-tx-1", "stale-tx-2"} {
+		update := ms.lastUpdateForTxid(txid)
+		if update == nil {
+			t.Fatalf("expected status update for %s", txid)
+		}
+		if update.Status != models.StatusRejected {
+			t.Fatalf("expected REJECTED for %s, got %s", txid, update.Status)
+		}
+		if !strings.Contains(update.ExtraInfo, "service restart") {
+			t.Fatalf("expected 'service restart' in ExtraInfo for %s, got %q", txid, update.ExtraInfo)
+		}
+	}
+}
+
+// Test 21: GET /tx/:txid returns PENDING_RETRY during retry window
+// (verified via the mockStore — the status is set correctly, API layer reads it)
+func TestRetry_StatusIsPendingRetry_DuringRetryWindow(t *testing.T) {
+	ms := newMockStore()
+
+	teranodeSrv := newTeranodeServerWithError("missing inputs for tx")
+	defer teranodeSrv.Close()
+
+	p := newPropagator("", teranodeSrv.URL, ms)
+
+	err := handleAndFlush(t, p, makePropMsg("tx-status"))
+	if err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	// Find the PENDING_RETRY update
+	found := false
+	for _, u := range ms.updatesForTxid("tx-status") {
+		if u.Status == models.StatusPendingRetry {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected at least one PENDING_RETRY status update")
 	}
 }
 

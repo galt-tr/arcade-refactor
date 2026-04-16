@@ -97,6 +97,7 @@ func (s *AerospikeStore) EnsureIndexes() error {
 		{setSubmissions, "txid", "idx_sub_txid", aero.STRING},
 		{setSubmissions, "callback_token", "idx_sub_callback_token", aero.STRING},
 		{setProcessedBlocks, "block_height", "idx_pb_block_height", aero.NUMERIC},
+		{setTransactions, "status", "idx_tx_status", aero.STRING},
 	}
 	for _, idx := range indexes {
 		_, err := s.client.CreateIndex(nil, s.namespace, idx.set, idx.name, idx.bin, idx.indexType)
@@ -260,6 +261,44 @@ func (s *AerospikeStore) SetStatusByBlockHash(_ context.Context, blockHash strin
 		txids = append(txids, txid)
 	}
 	return txids, nil
+}
+
+func (s *AerospikeStore) IncrementRetryCount(_ context.Context, txid string) (int, error) {
+	key, err := s.key(setTransactions, txid)
+	if err != nil {
+		return 0, err
+	}
+	rec, err := s.client.Operate(nil, key, aero.AddOp(aero.NewBin("retry_count", 1)), aero.GetOp())
+	if err != nil {
+		return 0, fmt.Errorf("increment retry count %s: %w", txid, err)
+	}
+	if v, ok := rec.Bins["retry_count"]; ok {
+		if n, ok := v.(int); ok {
+			return n, nil
+		}
+	}
+	return 1, nil
+}
+
+func (s *AerospikeStore) GetPendingRetryTxs(_ context.Context) ([]*models.TransactionStatus, error) {
+	stmt := aero.NewStatement(s.namespace, setTransactions)
+	stmt.SetFilter(aero.NewEqualFilter("status", string(models.StatusPendingRetry)))
+
+	rs, err := s.client.Query(nil, stmt)
+	if err != nil {
+		return nil, fmt.Errorf("query pending retry txs: %w", err)
+	}
+	defer rs.Close()
+
+	var results []*models.TransactionStatus
+	for rec := range rs.Results() {
+		if rec.Err != nil {
+			return nil, rec.Err
+		}
+		txid := getString(rec.Record, "txid")
+		results = append(results, recordToStatus(rec.Record, txid))
+	}
+	return results, nil
 }
 
 func (s *AerospikeStore) SetMinedByTxIDs(_ context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {

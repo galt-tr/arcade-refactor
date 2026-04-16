@@ -81,6 +81,12 @@ type Store interface {
 	// DeleteStumpsByBlockHash removes all STUMPs for a given block hash (used during reorg cleanup).
 	DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error
 
+	// IncrementRetryCount atomically increments the retry_count for a transaction and returns the new value.
+	IncrementRetryCount(ctx context.Context, txid string) (int, error)
+
+	// GetPendingRetryTxs retrieves all transactions with PENDING_RETRY status for retry recovery on startup.
+	GetPendingRetryTxs(ctx context.Context) ([]*models.TransactionStatus, error)
+
 	// EnsureIndexes creates any required secondary indexes for query operations.
 	EnsureIndexes() error
 

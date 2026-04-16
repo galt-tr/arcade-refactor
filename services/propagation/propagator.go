@@ -33,16 +33,30 @@ type Propagator struct {
 	teranodeClient *teranode.Client
 	merkleClient   *merkleservice.Client
 	consumer       *kafka.ConsumerGroup
+	retryBuf       *RetryBuffer
 
 	mu                sync.Mutex
 	pendingMsgs       []propagationMsg
 	merkleConcurrency int
+	retryMaxAttempts  int
 }
 
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, tc *teranode.Client, mc *merkleservice.Client) *Propagator {
 	merkleConcurrency := cfg.Propagation.MerkleConcurrency
 	if merkleConcurrency <= 0 {
 		merkleConcurrency = 10
+	}
+	retryMax := cfg.Propagation.RetryMaxAttempts
+	if retryMax <= 0 {
+		retryMax = 5
+	}
+	retryBackoff := cfg.Propagation.RetryBackoffMs
+	if retryBackoff <= 0 {
+		retryBackoff = 500
+	}
+	retryBufSize := cfg.Propagation.RetryBufferSize
+	if retryBufSize <= 0 {
+		retryBufSize = 10000
 	}
 	return &Propagator{
 		cfg:               cfg,
@@ -51,7 +65,9 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st st
 		store:             st,
 		teranodeClient:    tc,
 		merkleClient:      mc,
+		retryBuf:          NewRetryBuffer(retryBufSize, retryBackoff),
 		merkleConcurrency: merkleConcurrency,
+		retryMaxAttempts:  retryMax,
 	}
 }
 
@@ -72,6 +88,9 @@ func (p *Propagator) Start(ctx context.Context) error {
 		return fmt.Errorf("creating consumer group: %w", err)
 	}
 	p.consumer = consumer
+
+	// Recover any pending retries from a previous run
+	p.recoverPendingRetries(ctx)
 
 	p.logger.Info("propagation service started")
 	return consumer.Run(ctx)
@@ -107,18 +126,26 @@ func (p *Propagator) handleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	return nil
 }
 
-// flushBatch processes all accumulated messages as a batch.
+// flushBatch processes all accumulated messages as a batch,
+// then processes any ready retry entries.
 func (p *Propagator) flushBatch() error {
 	p.mu.Lock()
 	batch := p.pendingMsgs
 	p.pendingMsgs = nil
 	p.mu.Unlock()
 
-	if len(batch) == 0 {
-		return nil
+	ctx := context.Background()
+
+	if len(batch) > 0 {
+		if err := p.processBatch(ctx, batch); err != nil {
+			return err
+		}
 	}
 
-	return p.processBatch(context.Background(), batch)
+	// Process any ready retries
+	p.processRetries(ctx)
+
+	return nil
 }
 
 // processBatch handles a batch of propagation messages:
@@ -126,6 +153,19 @@ func (p *Propagator) flushBatch() error {
 // 2. Broadcast all raw txs to teranode endpoints in batch
 // 3. Update status for each transaction
 func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) error {
+	// Log batch summary for traceability
+	txidSample := make([]string, 0, 5)
+	for i, msg := range batch {
+		if i >= 5 {
+			break
+		}
+		txidSample = append(txidSample, msg.TXID)
+	}
+	p.logger.Info("processing batch",
+		zap.Int("count", len(batch)),
+		zap.Strings("txids_sample", txidSample),
+	)
+
 	// Step 1: Register all txids with merkle service (mandatory)
 	if p.merkleClient != nil && p.cfg.CallbackURL != "" {
 		regs := make([]merkleservice.Registration, len(batch))
@@ -148,23 +188,55 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 		rawTxs[i] = rawTx
 	}
 
-	var bestStatuses []*models.TransactionStatus
-	if len(batch) == 1 {
-		status := p.broadcastSingleToEndpoints(ctx, rawTxs[0], batch[0].TXID)
-		bestStatuses = []*models.TransactionStatus{status}
-	} else {
-		bestStatuses = p.broadcastBatchToEndpoints(ctx, rawTxs, batch)
+	type txResult struct {
+		status   *models.TransactionStatus
+		errMsg   string
+		rawTxHex string
 	}
 
-	// Step 3: Update status for each transaction
-	for i, status := range bestStatuses {
-		if status != nil {
-			if err := p.store.UpdateStatus(ctx, status); err != nil {
-				p.logger.Error("failed to update status",
-					zap.String("txid", batch[i].TXID),
-					zap.Error(err),
-				)
+	var results []txResult
+	if len(batch) == 1 {
+		br := p.broadcastSingleToEndpoints(ctx, rawTxs[0], batch[0].TXID)
+		results = []txResult{{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: batch[0].RawTx}}
+	} else {
+		// Batch broadcast — if it fails, fall back to single-tx for per-tx error classification
+		batchStatuses := p.broadcastBatchToEndpoints(ctx, rawTxs, batch)
+		allRejected := true
+		for _, s := range batchStatuses {
+			if s != nil && s.Status != models.StatusRejected {
+				allRejected = false
+				break
 			}
+		}
+		if allRejected && len(batchStatuses) > 0 {
+			// Fall back to single-tx to classify each error individually
+			results = make([]txResult, len(batch))
+			for i, msg := range batch {
+				br := p.broadcastSingleToEndpoints(ctx, rawTxs[i], msg.TXID)
+				results[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: msg.RawTx}
+			}
+		} else {
+			results = make([]txResult, len(batch))
+			for i, s := range batchStatuses {
+				results[i] = txResult{status: s, rawTxHex: batch[i].RawTx}
+			}
+		}
+	}
+
+	// Step 3: Update status for each transaction, with retry classification
+	for i, res := range results {
+		if res.status == nil {
+			continue
+		}
+		if res.status.Status == models.StatusRejected && IsRetryableError(res.errMsg) {
+			p.handleRetryableFailure(ctx, batch[i].TXID, res.rawTxHex)
+			continue
+		}
+		if err := p.store.UpdateStatus(ctx, res.status); err != nil {
+			p.logger.Error("failed to update status",
+				zap.String("txid", batch[i].TXID),
+				zap.Error(err),
+			)
 		}
 	}
 
@@ -172,13 +244,20 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 	return nil
 }
 
+// broadcastResult holds the outcome of a single-tx broadcast across all endpoints.
+type broadcastResult struct {
+	Status   *models.TransactionStatus
+	ErrorMsg string // best error message from endpoints (for retryable classification)
+}
+
 // broadcastSingleToEndpoints submits a single transaction to each teranode endpoint
 // using POST /tx, matching the original ARC single-tx broadcast behavior.
-func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byte, txid string) *models.TransactionStatus {
+// Returns the best status and the error message from the best-matching endpoint failure.
+func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byte, txid string) broadcastResult {
 	endpoints := p.teranodeClient.GetEndpoints()
 	if len(endpoints) == 0 {
 		p.logger.Error("no teranode endpoints configured")
-		return nil
+		return broadcastResult{}
 	}
 
 	type endpointResult struct {
@@ -208,6 +287,7 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 
 	// Find best status: 200→AcceptedByNetwork, 202→nil (no update), error→Rejected
 	var bestStatus models.Status
+	var lastErrMsg string
 	for result := range resultCh {
 		if result.err != nil {
 			p.logger.Debug("single broadcast endpoint failed",
@@ -215,6 +295,7 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 				zap.String("endpoint", result.endpoint),
 				zap.Error(result.err),
 			)
+			lastErrMsg = result.err.Error()
 			if statusPriority(models.StatusRejected) > statusPriority(bestStatus) {
 				bestStatus = models.StatusRejected
 			}
@@ -236,13 +317,16 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 	}
 
 	if bestStatus == "" {
-		return nil
+		return broadcastResult{}
 	}
 
-	return &models.TransactionStatus{
-		TxID:      txid,
-		Status:    bestStatus,
-		Timestamp: time.Now(),
+	return broadcastResult{
+		Status: &models.TransactionStatus{
+			TxID:      txid,
+			Status:    bestStatus,
+			Timestamp: time.Now(),
+		},
+		ErrorMsg: lastErrMsg,
 	}
 }
 
@@ -284,7 +368,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	anySuccess := false
 	for result := range resultCh {
 		if result.err != nil {
-			p.logger.Debug("batch broadcast endpoint failed",
+			p.logger.Warn("batch broadcast endpoint failed",
 				zap.String("endpoint", result.endpoint),
 				zap.Int("batch_size", len(batch)),
 				zap.Error(result.err),
@@ -319,6 +403,143 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	}
 
 	return statuses
+}
+
+// handleRetryableFailure adds a transaction to the retry buffer or rejects it if
+// the buffer is full or max attempts are exhausted.
+func (p *Propagator) handleRetryableFailure(ctx context.Context, txid, rawTxHex string) {
+	retryCount, err := p.store.IncrementRetryCount(ctx, txid)
+	if err != nil {
+		p.logger.Error("failed to increment retry count", zap.String("txid", txid), zap.Error(err))
+	}
+
+	if retryCount > p.retryMaxAttempts {
+		if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusRejected,
+			ExtraInfo: "broadcast retries exhausted",
+			Timestamp: time.Now(),
+		}); err != nil {
+			p.logger.Error("failed to reject after retries exhausted", zap.String("txid", txid), zap.Error(err))
+		}
+		p.retryBuf.Remove(txid)
+		return
+	}
+
+	entry := &RetryEntry{
+		TXID:      txid,
+		RawTxHex:  rawTxHex,
+		Attempt:   retryCount,
+		NextRetry: p.retryBuf.ComputeBackoff(retryCount),
+	}
+	if !p.retryBuf.Add(entry) {
+		if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusRejected,
+			ExtraInfo: "retry buffer full",
+			Timestamp: time.Now(),
+		}); err != nil {
+			p.logger.Error("failed to reject (buffer full)", zap.String("txid", txid), zap.Error(err))
+		}
+		return
+	}
+
+	// Set status to PENDING_RETRY
+	if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusPendingRetry,
+		Timestamp: time.Now(),
+	}); err != nil {
+		p.logger.Error("failed to set pending retry status", zap.String("txid", txid), zap.Error(err))
+	}
+
+	p.logger.Debug("transaction queued for retry",
+		zap.String("txid", txid),
+		zap.Int("attempt", retryCount),
+		zap.Int("buffer_size", p.retryBuf.Len()),
+	)
+}
+
+// recoverPendingRetries transitions any stale PENDING_RETRY transactions to REJECTED
+// on startup. Raw tx data is not persisted, so these cannot be retried after restart.
+func (p *Propagator) recoverPendingRetries(ctx context.Context) {
+	txs, err := p.store.GetPendingRetryTxs(ctx)
+	if err != nil {
+		p.logger.Warn("failed to query pending retries on startup", zap.Error(err))
+		return
+	}
+	if len(txs) == 0 {
+		return
+	}
+
+	rejected := 0
+	for _, tx := range txs {
+		if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
+			TxID:      tx.TxID,
+			Status:    models.StatusRejected,
+			ExtraInfo: "broadcast retries interrupted by service restart",
+			Timestamp: time.Now(),
+		}); err != nil {
+			p.logger.Error("failed to reject stale pending retry", zap.String("txid", tx.TxID), zap.Error(err))
+			continue
+		}
+		rejected++
+	}
+	if rejected > 0 {
+		p.logger.Info("rejected stale pending retries from previous run", zap.Int("count", rejected))
+	}
+}
+
+// processRetries broadcasts ready retry entries individually and handles the results.
+func (p *Propagator) processRetries(ctx context.Context) {
+	ready := p.retryBuf.Ready()
+	if len(ready) == 0 {
+		return
+	}
+
+	p.logger.Debug("processing retries", zap.Int("count", len(ready)))
+
+	for _, entry := range ready {
+		rawTx, err := hex.DecodeString(entry.RawTxHex)
+		if err != nil {
+			p.logger.Error("invalid raw tx hex in retry buffer", zap.String("txid", entry.TXID))
+			p.retryBuf.Remove(entry.TXID)
+			continue
+		}
+
+		br := p.broadcastSingleToEndpoints(ctx, rawTx, entry.TXID)
+
+		if br.Status != nil && br.Status.Status == models.StatusAcceptedByNetwork {
+			// Success
+			p.retryBuf.Remove(entry.TXID)
+			if err := p.store.UpdateStatus(ctx, br.Status); err != nil {
+				p.logger.Error("failed to update status after retry success", zap.String("txid", entry.TXID), zap.Error(err))
+			}
+			p.logger.Debug("retry succeeded", zap.String("txid", entry.TXID), zap.Int("attempt", entry.Attempt))
+			continue
+		}
+
+		// Still failing
+		p.retryBuf.Remove(entry.TXID)
+		if IsRetryableError(br.ErrorMsg) {
+			p.handleRetryableFailure(ctx, entry.TXID, entry.RawTxHex)
+		} else {
+			// Permanent failure on retry
+			status := models.StatusRejected
+			extraInfo := ""
+			if br.ErrorMsg != "" {
+				extraInfo = br.ErrorMsg
+			}
+			if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
+				TxID:      entry.TXID,
+				Status:    status,
+				ExtraInfo: extraInfo,
+				Timestamp: time.Now(),
+			}); err != nil {
+				p.logger.Error("failed to reject after retry", zap.String("txid", entry.TXID), zap.Error(err))
+			}
+		}
+	}
 }
 
 // statusPriority returns a numeric priority for broadcast result aggregation.

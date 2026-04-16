@@ -62,6 +62,9 @@ type HealthConfig struct {
 
 type PropagationConfig struct {
 	MerkleConcurrency int `mapstructure:"merkle_concurrency"`
+	RetryMaxAttempts  int `mapstructure:"retry_max_attempts"`
+	RetryBackoffMs    int `mapstructure:"retry_backoff_ms"`
+	RetryBufferSize   int `mapstructure:"retry_buffer_size"`
 }
 
 func BindFlags(cmd *cobra.Command) {
@@ -122,6 +125,9 @@ func setDefaults() {
 	viper.SetDefault("aerospike.pool_size", 256)
 	viper.SetDefault("health.port", 8081)
 	viper.SetDefault("propagation.merkle_concurrency", 10)
+	viper.SetDefault("propagation.retry_max_attempts", 5)
+	viper.SetDefault("propagation.retry_backoff_ms", 500)
+	viper.SetDefault("propagation.retry_buffer_size", 10000)
 }
 
 func validate(cfg *Config) error {
