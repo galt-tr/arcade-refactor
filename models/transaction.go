@@ -63,6 +63,8 @@ const (
 	StatusAcceptedByNetwork = Status("ACCEPTED_BY_NETWORK")
 	// StatusSeenOnNetwork indicates the transaction was seen on the network.
 	StatusSeenOnNetwork = Status("SEEN_ON_NETWORK")
+	// StatusSeenMultipleNodes indicates the transaction was seen by multiple independent miners.
+	StatusSeenMultipleNodes = Status("SEEN_MULTIPLE_NODES")
 	// StatusDoubleSpendAttempted indicates a double spend was attempted.
 	StatusDoubleSpendAttempted = Status("DOUBLE_SPEND_ATTEMPTED")
 	// StatusRejected indicates the transaction was rejected.
@@ -82,10 +84,10 @@ func (s Status) DisallowedPreviousStatuses() []Status {
 	case StatusUnknown, StatusReceived:
 		return []Status{}
 	case StatusSentToNetwork:
-		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
+		return []Status{StatusSentToNetwork, StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
 	case StatusAcceptedByNetwork:
-		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
-	case StatusSeenOnNetwork, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable:
+		return []Status{StatusAcceptedByNetwork, StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined}
+	case StatusSeenOnNetwork, StatusSeenMultipleNodes, StatusRejected, StatusDoubleSpendAttempted, StatusMined, StatusImmutable:
 		return []Status{}
 	default:
 		return []Status{}

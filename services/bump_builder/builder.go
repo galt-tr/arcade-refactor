@@ -120,8 +120,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage
 	}
 
 	if len(stumps) == 0 {
-		logger.Debug("no STUMPs found for block, nothing to build")
-		return nil
+		return fmt.Errorf("no STUMPs found for block %s, may not be stored yet", blockHash)
 	}
 
 	logger.Info("building compound BUMP", zap.Int("stump_count", len(stumps)))

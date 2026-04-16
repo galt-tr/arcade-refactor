@@ -26,23 +26,32 @@ type propagationMsg struct {
 }
 
 type Propagator struct {
-	cfg             *config.Config
-	logger          *zap.Logger
-	producer        *kafka.Producer
-	store           store.Store
-	teranodeClient  *teranode.Client
-	merkleClient    *merkleservice.Client
-	consumer        *kafka.ConsumerGroup
+	cfg            *config.Config
+	logger         *zap.Logger
+	producer       *kafka.Producer
+	store          store.Store
+	teranodeClient *teranode.Client
+	merkleClient   *merkleservice.Client
+	consumer       *kafka.ConsumerGroup
+
+	mu                sync.Mutex
+	pendingMsgs       []propagationMsg
+	merkleConcurrency int
 }
 
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, tc *teranode.Client, mc *merkleservice.Client) *Propagator {
+	merkleConcurrency := cfg.Propagation.MerkleConcurrency
+	if merkleConcurrency <= 0 {
+		merkleConcurrency = 10
+	}
 	return &Propagator{
-		cfg:            cfg,
-		logger:         logger.Named("propagation"),
-		producer:       producer,
-		store:          st,
-		teranodeClient: tc,
-		merkleClient:   mc,
+		cfg:               cfg,
+		logger:            logger.Named("propagation"),
+		producer:          producer,
+		store:             st,
+		teranodeClient:    tc,
+		merkleClient:      mc,
+		merkleConcurrency: merkleConcurrency,
 	}
 }
 
@@ -54,6 +63,7 @@ func (p *Propagator) Start(ctx context.Context) error {
 		GroupID:    p.cfg.Kafka.ConsumerGroup + "-propagation",
 		Topics:     []string{kafka.TopicPropagation},
 		Handler:    p.handleMessage,
+		FlushFunc:  p.flushBatch,
 		Producer:   p.producer,
 		MaxRetries: p.cfg.Kafka.MaxRetries,
 		Logger:     p.logger,
@@ -75,49 +85,108 @@ func (p *Propagator) Stop() error {
 	return nil
 }
 
+// handleMessage accumulates a single propagation message into the pending batch.
+// The consumer's drain-then-flush pattern calls flushBatch after all immediately
+// available messages have been processed, so the batch size naturally matches
+// what the client submitted — no configured threshold needed.
 func (p *Propagator) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
 	var propMsg propagationMsg
 	if err := json.Unmarshal(msg.Value, &propMsg); err != nil {
 		return fmt.Errorf("unmarshaling propagation message: %w", err)
 	}
 
-	logger := p.logger.With(zap.String("txid", propMsg.TXID))
-
-	rawTx, err := hex.DecodeString(propMsg.RawTx)
-	if err != nil {
+	// Validate hex before accumulating
+	if _, err := hex.DecodeString(propMsg.RawTx); err != nil {
 		return fmt.Errorf("decoding raw tx hex: %w", err)
 	}
 
-	// Register with merkle-service BEFORE broadcasting (best-effort)
-	if p.merkleClient != nil && p.cfg.CallbackURL != "" {
-		if err := p.merkleClient.Register(ctx, propMsg.TXID, p.cfg.CallbackURL); err != nil {
-			logger.Warn("failed to register with merkle-service", zap.Error(err))
-		}
-	}
+	p.mu.Lock()
+	p.pendingMsgs = append(p.pendingMsgs, propMsg)
+	p.mu.Unlock()
 
-	// Broadcast to all datahub endpoints concurrently via teranode client
-	bestStatus := p.broadcastToEndpoints(ctx, rawTx, propMsg.TXID)
-
-	// Update transaction status based on best result
-	if bestStatus != nil {
-		if err := p.store.UpdateStatus(ctx, bestStatus); err != nil {
-			logger.Error("failed to update status", zap.Error(err))
-		}
-	}
-
-	logger.Info("transaction propagated")
 	return nil
 }
 
-// broadcastToEndpoints submits to all teranode endpoints concurrently and returns the best status.
-func (p *Propagator) broadcastToEndpoints(ctx context.Context, rawTx []byte, txid string) *models.TransactionStatus {
+// flushBatch processes all accumulated messages as a batch.
+func (p *Propagator) flushBatch() error {
+	p.mu.Lock()
+	batch := p.pendingMsgs
+	p.pendingMsgs = nil
+	p.mu.Unlock()
+
+	if len(batch) == 0 {
+		return nil
+	}
+
+	return p.processBatch(context.Background(), batch)
+}
+
+// processBatch handles a batch of propagation messages:
+// 1. Register all txids with merkle service concurrently
+// 2. Broadcast all raw txs to teranode endpoints in batch
+// 3. Update status for each transaction
+func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) error {
+	// Step 1: Register all txids with merkle service (mandatory)
+	if p.merkleClient != nil && p.cfg.CallbackURL != "" {
+		regs := make([]merkleservice.Registration, len(batch))
+		for i, msg := range batch {
+			regs[i] = merkleservice.Registration{
+				TxID:        msg.TXID,
+				CallbackURL: p.cfg.CallbackURL,
+			}
+		}
+		if err := p.merkleClient.RegisterBatch(ctx, regs, p.merkleConcurrency); err != nil {
+			return fmt.Errorf("merkle-service batch registration failed: %w", err)
+		}
+		p.logger.Debug("batch registered with merkle-service", zap.Int("count", len(batch)))
+	}
+
+	// Step 2: Broadcast all raw txs to teranode endpoints
+	rawTxs := make([][]byte, len(batch))
+	for i, msg := range batch {
+		rawTx, _ := hex.DecodeString(msg.RawTx) // already validated in handleMessage
+		rawTxs[i] = rawTx
+	}
+
+	var bestStatuses []*models.TransactionStatus
+	if len(batch) == 1 {
+		status := p.broadcastSingleToEndpoints(ctx, rawTxs[0], batch[0].TXID)
+		bestStatuses = []*models.TransactionStatus{status}
+	} else {
+		bestStatuses = p.broadcastBatchToEndpoints(ctx, rawTxs, batch)
+	}
+
+	// Step 3: Update status for each transaction
+	for i, status := range bestStatuses {
+		if status != nil {
+			if err := p.store.UpdateStatus(ctx, status); err != nil {
+				p.logger.Error("failed to update status",
+					zap.String("txid", batch[i].TXID),
+					zap.Error(err),
+				)
+			}
+		}
+	}
+
+	p.logger.Info("batch propagated", zap.Int("count", len(batch)))
+	return nil
+}
+
+// broadcastSingleToEndpoints submits a single transaction to each teranode endpoint
+// using POST /tx, matching the original ARC single-tx broadcast behavior.
+func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byte, txid string) *models.TransactionStatus {
 	endpoints := p.teranodeClient.GetEndpoints()
 	if len(endpoints) == 0 {
 		p.logger.Error("no teranode endpoints configured")
 		return nil
 	}
 
-	resultCh := make(chan *models.TransactionStatus, len(endpoints))
+	type endpointResult struct {
+		statusCode int
+		err        error
+	}
+
+	resultCh := make(chan endpointResult, len(endpoints))
 	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -127,36 +196,7 @@ func (p *Propagator) broadcastToEndpoints(ctx context.Context, rawTx []byte, txi
 		go func(ep string) {
 			defer wg.Done()
 			statusCode, err := p.teranodeClient.SubmitTransaction(submitCtx, ep, rawTx)
-			if err != nil {
-				p.logger.Debug("endpoint rejected tx",
-					zap.String("txid", txid),
-					zap.String("endpoint", ep),
-					zap.Error(err),
-				)
-				resultCh <- &models.TransactionStatus{
-					TxID:      txid,
-					Status:    models.StatusRejected,
-					Timestamp: time.Now(),
-					ExtraInfo: err.Error(),
-				}
-				return
-			}
-
-			var txStatus models.Status
-			switch statusCode {
-			case http.StatusOK:
-				txStatus = models.StatusAcceptedByNetwork
-			case http.StatusNoContent, http.StatusAccepted:
-				txStatus = models.StatusSentToNetwork
-			default:
-				return
-			}
-
-			resultCh <- &models.TransactionStatus{
-				TxID:      txid,
-				Status:    txStatus,
-				Timestamp: time.Now(),
-			}
+			resultCh <- endpointResult{statusCode: statusCode, err: err}
 		}(endpoint)
 	}
 
@@ -165,17 +205,92 @@ func (p *Propagator) broadcastToEndpoints(ctx context.Context, rawTx []byte, txi
 		close(resultCh)
 	}()
 
-	var best *models.TransactionStatus
-	for status := range resultCh {
-		if status == nil {
+	// Find best status: 200→AcceptedByNetwork, 202→nil (no update), error→Rejected
+	var bestStatus models.Status
+	for result := range resultCh {
+		if result.err != nil {
+			if statusPriority(models.StatusRejected) > statusPriority(bestStatus) {
+				bestStatus = models.StatusRejected
+			}
 			continue
 		}
-		if best == nil || statusPriority(status.Status) > statusPriority(best.Status) {
-			best = status
+		switch result.statusCode {
+		case http.StatusOK:
+			if statusPriority(models.StatusAcceptedByNetwork) > statusPriority(bestStatus) {
+				bestStatus = models.StatusAcceptedByNetwork
+			}
+		case http.StatusAccepted:
+			// 202 means no status update — matching original behavior
 		}
 	}
 
-	return best
+	if bestStatus == "" {
+		return nil
+	}
+
+	return &models.TransactionStatus{
+		TxID:      txid,
+		Status:    bestStatus,
+		Timestamp: time.Now(),
+	}
+}
+
+// broadcastBatchToEndpoints submits all transactions to each teranode endpoint
+// using the batch POST /txs endpoint. Uses binary success/failure logic matching
+// the original: any endpoint success → AcceptedByNetwork for all, all fail → Rejected for all.
+func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) []*models.TransactionStatus {
+	endpoints := p.teranodeClient.GetEndpoints()
+	if len(endpoints) == 0 {
+		p.logger.Error("no teranode endpoints configured")
+		return make([]*models.TransactionStatus, len(batch))
+	}
+
+	type endpointResult struct {
+		err error
+	}
+
+	resultCh := make(chan endpointResult, len(endpoints))
+	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, endpoint := range endpoints {
+		wg.Add(1)
+		go func(ep string) {
+			defer wg.Done()
+			_, err := p.teranodeClient.SubmitTransactions(submitCtx, ep, rawTxs)
+			resultCh <- endpointResult{err: err}
+		}(endpoint)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// Binary outcome: any success → AcceptedByNetwork, all fail → Rejected
+	anySuccess := false
+	for result := range resultCh {
+		if result.err == nil {
+			anySuccess = true
+		}
+	}
+
+	now := time.Now()
+	statuses := make([]*models.TransactionStatus, len(batch))
+	status := models.StatusRejected
+	if anySuccess {
+		status = models.StatusAcceptedByNetwork
+	}
+	for i, msg := range batch {
+		statuses[i] = &models.TransactionStatus{
+			TxID:      msg.TXID,
+			Status:    status,
+			Timestamp: now,
+		}
+	}
+
+	return statuses
 }
 
 // statusPriority returns a numeric priority for broadcast result aggregation.

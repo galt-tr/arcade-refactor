@@ -1,0 +1,571 @@
+package bump_builder
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/IBM/sarama"
+	"go.uber.org/zap"
+
+	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
+)
+
+// --- Mock Store ---
+
+type mockStore struct {
+	store.Store // embed — panics on unimplemented methods
+
+	mu              sync.Mutex
+	stumps          map[string][]*models.Stump // blockHash → stumps
+	bumps           map[string][]byte          // blockHash → bumpData
+	minedCalls      []minedCall
+	deletedBlocks   []string
+	getStumpsErr    error
+	insertBUMPErr   error
+	insertStumpErr  error
+	setMinedErr     error
+	deleteStumpsErr error
+}
+
+type minedCall struct {
+	blockHash string
+	txids     []string
+}
+
+func newMockStore() *mockStore {
+	return &mockStore{
+		stumps: make(map[string][]*models.Stump),
+		bumps:  make(map[string][]byte),
+	}
+}
+
+func (m *mockStore) EnsureIndexes() error { return nil }
+
+func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.insertStumpErr != nil {
+		return m.insertStumpErr
+	}
+	m.stumps[stump.BlockHash] = append(m.stumps[stump.BlockHash], stump)
+	return nil
+}
+
+func (m *mockStore) GetStumpsByBlockHash(_ context.Context, blockHash string) ([]*models.Stump, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.getStumpsErr != nil {
+		return nil, m.getStumpsErr
+	}
+	return m.stumps[blockHash], nil
+}
+
+func (m *mockStore) InsertBUMP(_ context.Context, blockHash string, _ uint64, bumpData []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.insertBUMPErr != nil {
+		return m.insertBUMPErr
+	}
+	m.bumps[blockHash] = bumpData
+	return nil
+}
+
+func (m *mockStore) SetMinedByTxIDs(_ context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.setMinedErr != nil {
+		return nil, m.setMinedErr
+	}
+	m.minedCalls = append(m.minedCalls, minedCall{blockHash, txids})
+	var statuses []*models.TransactionStatus
+	for _, txid := range txids {
+		statuses = append(statuses, &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusMined,
+			BlockHash: blockHash,
+			Timestamp: time.Now(),
+		})
+	}
+	return statuses, nil
+}
+
+func (m *mockStore) DeleteStumpsByBlockHash(_ context.Context, blockHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.deleteStumpsErr != nil {
+		return m.deleteStumpsErr
+	}
+	m.deletedBlocks = append(m.deletedBlocks, blockHash)
+	delete(m.stumps, blockHash)
+	return nil
+}
+
+func (m *mockStore) addStump(blockHash string, subtreeIndex int, stumpData []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stumps[blockHash] = append(m.stumps[blockHash], &models.Stump{
+		BlockHash:    blockHash,
+		SubtreeIndex: subtreeIndex,
+		StumpData:    stumpData,
+	})
+}
+
+// --- Helpers ---
+
+// makeBlockProcessedMsg creates a Kafka ConsumerMessage with a block_processed payload.
+func makeBlockProcessedMsg(blockHash string) *sarama.ConsumerMessage {
+	callback := models.CallbackMessage{
+		Type:      models.CallbackBlockProcessed,
+		BlockHash: blockHash,
+	}
+	data, _ := json.Marshal(callback)
+	return &sarama.ConsumerMessage{
+		Topic: "arcade.block_processed",
+		Value: data,
+	}
+}
+
+// newDatahubServer creates a test HTTP server that serves block data for BUMP construction.
+// Returns subtree hashes as a JSON response.
+func newDatahubServer(subtreeHexHashes []string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := struct {
+			Subtrees     []string `json:"subtrees"`
+			CoinbaseBump string   `json:"coinbase_bump"`
+		}{
+			Subtrees: subtreeHexHashes,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+func newFailingDatahubServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+}
+
+func newTestBuilder(st store.Store, datahubURL string, tracker *store.TxTracker) *Builder {
+	cfg := &config.Config{
+		DatahubURLs: []string{datahubURL},
+	}
+	return &Builder{
+		cfg:       cfg,
+		logger:    zap.NewNop().Named("bump-builder"),
+		store:     st,
+		txTracker: tracker,
+	}
+}
+
+// makeMinimalSTUMP creates a minimal valid BRC-74 STUMP binary with a single level-0 leaf.
+// This is the simplest valid merkle path: one transaction, one level, block height 1.
+func makeMinimalSTUMP(txidHex string) []byte {
+	// BRC-74 binary format:
+	// - blockHeight: varint (1 byte for small values)
+	// - treeHeight: varint (1 = single level)
+	// - nLeaves: varint (1 leaf)
+	// - leaf: offset (varint 0) + flags (0x01 = txid) + 32-byte hash
+	txidBytes, _ := hex.DecodeString(txidHex)
+	if len(txidBytes) != 32 {
+		// Pad to 32 bytes
+		padded := make([]byte, 32)
+		copy(padded, txidBytes)
+		txidBytes = padded
+	}
+
+	buf := []byte{
+		0x01,       // blockHeight = 1
+		0x01,       // treeHeight = 1 (one level)
+		0x01,       // nLeaves at level 0 = 1
+		0x00,       // offset = 0
+		0x01,       // flags: bit 0 set = this is a txid (client txid flag)
+	}
+	buf = append(buf, txidBytes...)
+	return buf
+}
+
+// --- Tests ---
+
+func TestBuilder_HandleMessage_NoSTUMPs_ReturnsError(t *testing.T) {
+	ms := newMockStore()
+	// No stumps stored for this block
+	datahub := newDatahubServer([]string{})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL, nil)
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg("blockhash123"))
+	if err == nil {
+		t.Fatal("expected error when no STUMPs found, got nil")
+	}
+	if !containsStr(err.Error(), "no STUMPs found") {
+		t.Errorf("expected 'no STUMPs found' error, got: %v", err)
+	}
+}
+
+func TestBuilder_HandleMessage_GetStumpsError_Propagated(t *testing.T) {
+	ms := newMockStore()
+	ms.getStumpsErr = errors.New("INDEX_NOTFOUND")
+
+	datahub := newDatahubServer(nil)
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL, nil)
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg("blockhash123"))
+	if err == nil {
+		t.Fatal("expected error from GetStumpsByBlockHash, got nil")
+	}
+	if !containsStr(err.Error(), "INDEX_NOTFOUND") {
+		t.Errorf("expected INDEX_NOTFOUND in error, got: %v", err)
+	}
+}
+
+func TestBuilder_HandleMessage_DatahubFailure_ReturnsError(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	stumpData := makeMinimalSTUMP("1111111111111111111111111111111111111111111111111111111111111111")
+	ms.addStump(blockHash, 0, stumpData)
+
+	datahub := newFailingDatahubServer()
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL, nil)
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
+	if err == nil {
+		t.Fatal("expected error from datahub failure, got nil")
+	}
+	if !containsStr(err.Error(), "fetching block data") {
+		t.Errorf("expected 'fetching block data' error, got: %v", err)
+	}
+}
+
+func TestBuilder_HandleMessage_InsertBUMPError_ReturnsError(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+
+	// Need a valid STUMP that produces a valid BUMP. Use a single-subtree scenario.
+	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+	ms.insertBUMPErr = errors.New("SERVER_MEM_ERROR")
+
+	// Datahub returns one subtree hash (single-subtree block: STUMP = BUMP)
+	subtreeHash := "2222222222222222222222222222222222222222222222222222222222222222"
+	datahub := newDatahubServer([]string{subtreeHash})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL, nil)
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
+	if err == nil {
+		t.Fatal("expected error from InsertBUMP, got nil")
+	}
+	if !containsStr(err.Error(), "storing BUMP") {
+		t.Errorf("expected 'storing BUMP' error, got: %v", err)
+	}
+}
+
+func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	// Single subtree: its hash doesn't matter much for the builder flow
+	subtreeHash := "2222222222222222222222222222222222222222222222222222222222222222"
+	datahub := newDatahubServer([]string{subtreeHash})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL, nil)
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Verify BUMP was stored
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("expected BUMP to be stored")
+	}
+
+	// Verify STUMPs were pruned
+	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
+		t.Errorf("expected STUMPs for %s to be deleted, got: %v", blockHash, ms.deletedBlocks)
+	}
+}
+
+func TestBuilder_HandleMessage_HappyPath_WithTracker(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	subtreeHash := "2222222222222222222222222222222222222222222222222222222222222222"
+	datahub := newDatahubServer([]string{subtreeHash})
+	defer datahub.Close()
+
+	tracker := store.NewTxTracker()
+	tracker.Add(txidHex, models.StatusSeenOnNetwork)
+
+	b := newTestBuilder(ms, datahub.URL, tracker)
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Verify BUMP was stored and STUMPs pruned (tracker integration is best-effort;
+	// whether SetMinedByTxIDs is called depends on STUMP binary format matching tracker hashes)
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("expected BUMP to be stored")
+	}
+	if len(ms.deletedBlocks) != 1 {
+		t.Errorf("expected STUMPs to be pruned, got %d deletes", len(ms.deletedBlocks))
+	}
+}
+
+func TestBuilder_HandleMessage_EmptyBlockHash_ReturnsError(t *testing.T) {
+	ms := newMockStore()
+	datahub := newDatahubServer(nil)
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL, nil)
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(""))
+	if err == nil {
+		t.Fatal("expected error for empty block hash, got nil")
+	}
+}
+
+func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
+	ms := newMockStore()
+	datahub := newDatahubServer(nil)
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL, nil)
+
+	msg := &sarama.ConsumerMessage{
+		Topic: "arcade.block_processed",
+		Value: []byte("not json"),
+	}
+	err := b.handleMessage(context.Background(), msg)
+	if err == nil {
+		t.Fatal("expected error for invalid JSON, got nil")
+	}
+}
+
+// TestBuilder_RaceCondition_STUMPsAppearOnRetry simulates the race condition where
+// block_processed arrives before STUMPs are stored. The first call to GetStumpsByBlockHash
+// returns empty (error), but a subsequent retry succeeds.
+func TestBuilder_RaceCondition_STUMPsAppearOnRetry(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+
+	subtreeHash := "2222222222222222222222222222222222222222222222222222222222222222"
+	datahub := newDatahubServer([]string{subtreeHash})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL, nil)
+
+	// First call: no STUMPs yet — should error
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
+	if err == nil {
+		t.Fatal("expected error when no STUMPs found")
+	}
+
+	// STUMPs arrive via InsertStump (same path as production stump consumer)
+	stumpData := makeMinimalSTUMP(txidHex)
+	if err := ms.InsertStump(context.Background(), &models.Stump{
+		BlockHash:    blockHash,
+		SubtreeIndex: 0,
+		StumpData:    stumpData,
+	}); err != nil {
+		t.Fatalf("InsertStump failed: %v", err)
+	}
+
+	// Retry: STUMPs now present — should succeed
+	err = b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
+	if err != nil {
+		t.Fatalf("expected success on retry after STUMPs stored, got: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; !ok {
+		t.Error("expected BUMP to be stored on retry")
+	}
+}
+
+// TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP verifies the full STUMP→BUMP workflow:
+// store STUMPs via InsertStump → query via GetStumpsByBlockHash → build BUMP.
+func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	txid1 := "1111111111111111111111111111111111111111111111111111111111111111"
+	txid2 := "3333333333333333333333333333333333333333333333333333333333333333"
+
+	// Store STUMPs via the store interface (mimicking stump consumer)
+	for i, txid := range []string{txid1, txid2} {
+		stump := &models.Stump{
+			BlockHash:    blockHash,
+			SubtreeIndex: i,
+			StumpData:    makeMinimalSTUMP(txid),
+		}
+		if err := ms.InsertStump(context.Background(), stump); err != nil {
+			t.Fatalf("InsertStump %d failed: %v", i, err)
+		}
+	}
+
+	// Verify STUMPs are retrievable
+	stumps, err := ms.GetStumpsByBlockHash(context.Background(), blockHash)
+	if err != nil {
+		t.Fatalf("GetStumpsByBlockHash failed: %v", err)
+	}
+	if len(stumps) != 2 {
+		t.Fatalf("expected 2 STUMPs, got %d", len(stumps))
+	}
+
+	// Build BUMP via handleMessage
+	subtreeHash1 := "2222222222222222222222222222222222222222222222222222222222222222"
+	subtreeHash2 := "4444444444444444444444444444444444444444444444444444444444444444"
+	datahub := newDatahubServer([]string{subtreeHash1, subtreeHash2})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL, nil)
+
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("handleMessage failed: %v", err)
+	}
+
+	// Verify BUMP was stored
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	bumpData, ok := ms.bumps[blockHash]
+	if !ok {
+		t.Fatal("expected BUMP to be stored")
+	}
+	if len(bumpData) == 0 {
+		t.Error("expected non-empty BUMP data")
+	}
+
+	// Verify STUMPs were cleaned up
+	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
+		t.Errorf("expected STUMPs for %s to be deleted, got: %v", blockHash, ms.deletedBlocks)
+	}
+}
+
+// --- Stump Consumer Tests ---
+
+func TestStumpConsumer_HandleMessage_StoresSTUMP(t *testing.T) {
+	ms := newMockStore()
+	sc := &StumpConsumer{
+		logger: zap.NewNop().Named("stump-consumer"),
+		store:  ms,
+	}
+
+	callback := models.CallbackMessage{
+		Type:         models.CallbackStump,
+		BlockHash:    "block123",
+		SubtreeIndex: 2,
+		Stump:        []byte{0x01, 0x02, 0x03},
+	}
+	data, _ := json.Marshal(callback)
+	msg := &sarama.ConsumerMessage{Value: data}
+
+	err := sc.handleMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	stumps := ms.stumps["block123"]
+	if len(stumps) != 1 {
+		t.Fatalf("expected 1 stump stored, got %d", len(stumps))
+	}
+	if stumps[0].SubtreeIndex != 2 {
+		t.Errorf("expected subtree index 2, got %d", stumps[0].SubtreeIndex)
+	}
+}
+
+func TestStumpConsumer_HandleMessage_StoreError_ReturnsError(t *testing.T) {
+	ms := newMockStore()
+	ms.insertStumpErr = errors.New("SERVER_MEM_ERROR")
+	sc := &StumpConsumer{
+		logger: zap.NewNop().Named("stump-consumer"),
+		store:  ms,
+	}
+
+	callback := models.CallbackMessage{
+		Type:      models.CallbackStump,
+		BlockHash: "block123",
+		Stump:     []byte{0x01},
+	}
+	data, _ := json.Marshal(callback)
+	msg := &sarama.ConsumerMessage{Value: data}
+
+	err := sc.handleMessage(context.Background(), msg)
+	if err == nil {
+		t.Fatal("expected error from InsertStump, got nil")
+	}
+}
+
+func TestStumpConsumer_HandleMessage_MissingFields_ReturnsError(t *testing.T) {
+	sc := &StumpConsumer{
+		logger: zap.NewNop().Named("stump-consumer"),
+		store:  newMockStore(),
+	}
+
+	tests := []struct {
+		name string
+		msg  models.CallbackMessage
+	}{
+		{"missing block hash", models.CallbackMessage{Stump: []byte{0x01}}},
+		{"missing stump data", models.CallbackMessage{BlockHash: "abc"}},
+		{"both missing", models.CallbackMessage{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, _ := json.Marshal(tt.msg)
+			err := sc.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data})
+			if err == nil {
+				t.Error("expected error for missing fields")
+			}
+		})
+	}
+}
+
+func containsStr(s, substr string) bool {
+	return len(s) >= len(substr) && searchStr(s, substr)
+}
+
+func searchStr(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

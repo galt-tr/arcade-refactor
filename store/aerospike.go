@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	aero "github.com/aerospike/aerospike-client-go/v7"
@@ -60,11 +61,18 @@ func NewAerospikeStore(cfg config.Aero) (*AerospikeStore, error) {
 		return nil, fmt.Errorf("connecting to aerospike: %w", err)
 	}
 
-	return &AerospikeStore{
+	s := &AerospikeStore{
 		client:    client,
 		namespace: cfg.Namespace,
 		batchSize: cfg.BatchSize,
-	}, nil
+	}
+
+	if err := s.EnsureIndexes(); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("creating indexes: %w", err)
+	}
+
+	return s, nil
 }
 
 func (s *AerospikeStore) Healthy() bool {
@@ -73,6 +81,28 @@ func (s *AerospikeStore) Healthy() bool {
 
 func (s *AerospikeStore) Close() error {
 	s.client.Close()
+	return nil
+}
+
+func (s *AerospikeStore) EnsureIndexes() error {
+	indexes := []struct {
+		set, bin, name string
+		indexType      aero.IndexType
+	}{
+		{setStumps, "block_hash", "idx_stumps_block_hash", aero.STRING},
+		{setTransactions, "block_hash", "idx_tx_block_hash", aero.STRING},
+		{setSubmissions, "txid", "idx_sub_txid", aero.STRING},
+		{setSubmissions, "callback_token", "idx_sub_callback_token", aero.STRING},
+		{setProcessedBlocks, "block_height", "idx_pb_block_height", aero.NUMERIC},
+	}
+	for _, idx := range indexes {
+		_, err := s.client.CreateIndex(nil, s.namespace, idx.set, idx.name, idx.bin, idx.indexType)
+		if err != nil {
+			if !strings.Contains(err.Error(), "Index already exists") {
+				return fmt.Errorf("creating index %s: %w", idx.name, err)
+			}
+		}
+	}
 	return nil
 }
 

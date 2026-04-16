@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 const defaultTimeout = 30 * time.Second
@@ -75,4 +77,33 @@ func (c *Client) Register(ctx context.Context, txid, callbackURL string) error {
 	}
 
 	return nil
+}
+
+// Registration represents a single txid+callbackURL pair for batch registration.
+type Registration struct {
+	TxID        string
+	CallbackURL string
+}
+
+// RegisterBatch registers multiple transactions concurrently with bounded parallelism.
+// Returns on first error with context cancellation (fail-fast).
+func (c *Client) RegisterBatch(ctx context.Context, registrations []Registration, maxConcurrency int) error {
+	if len(registrations) == 0 {
+		return nil
+	}
+	if maxConcurrency <= 0 {
+		maxConcurrency = 10
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxConcurrency)
+
+	for _, reg := range registrations {
+		reg := reg
+		g.Go(func() error {
+			return c.Register(gctx, reg.TxID, reg.CallbackURL)
+		})
+	}
+
+	return g.Wait()
 }

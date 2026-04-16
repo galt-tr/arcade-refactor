@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -26,6 +27,9 @@ type Validator struct {
 	txTracker   *store.TxTracker
 	txValidator *validator.Validator
 	consumer    *kafka.ConsumerGroup
+
+	mu           sync.Mutex
+	pendingProps []kafka.KeyValue
 }
 
 func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, tracker *store.TxTracker, v *validator.Validator) *Validator {
@@ -47,6 +51,7 @@ func (v *Validator) Start(ctx context.Context) error {
 		GroupID:    v.cfg.Kafka.ConsumerGroup + "-tx-validator",
 		Topics:     []string{kafka.TopicTransaction},
 		Handler:    v.handleMessage,
+		FlushFunc:  v.flushPropagation,
 		Producer:   v.producer,
 		MaxRetries: v.cfg.Kafka.MaxRetries,
 		Logger:     v.logger,
@@ -125,9 +130,10 @@ func (v *Validator) handleNewTransaction(ctx context.Context, msg txMessage) err
 		return nil
 	}
 
-	// Validate transaction
+	// Validate transaction (skip fees and scripts to match old ARC behavior —
+	// let the network validate these)
 	if v.txValidator != nil {
-		if valErr := v.txValidator.ValidateTransaction(ctx, tx, false, false); valErr != nil {
+		if valErr := v.txValidator.ValidateTransaction(ctx, tx, true, true); valErr != nil {
 			logger.Info("transaction validation failed", zap.Error(valErr))
 			v.store.UpdateStatus(ctx, &models.TransactionStatus{
 				TxID:      txid,
@@ -142,15 +148,38 @@ func (v *Validator) handleNewTransaction(ctx context.Context, msg txMessage) err
 	// Track and register with merkle service before propagation
 	v.txTracker.Add(txid, existingStatus.Status)
 
-	// Publish to propagation topic
-	propMsg := map[string]string{
-		"txid":   txid,
-		"raw_tx": msg.RawTx,
-	}
-	if err := v.producer.Send(kafka.TopicPropagation, txid, propMsg); err != nil {
-		return fmt.Errorf("publishing to propagation: %w", err)
-	}
+	// Accumulate propagation message — the consumer's drain-then-flush
+	// pattern calls flushPropagation after all ready messages are processed,
+	// so the batch naturally matches what the client submitted.
+	v.mu.Lock()
+	v.pendingProps = append(v.pendingProps, kafka.KeyValue{
+		Key:   txid,
+		Value: map[string]string{"txid": txid, "raw_tx": msg.RawTx},
+	})
+	v.mu.Unlock()
 
 	logger.Info("transaction validated and queued for propagation")
+	return nil
+}
+
+// flushPropagation publishes all pending propagation messages in a single batch.
+func (v *Validator) flushPropagation() error {
+	v.mu.Lock()
+	pending := v.pendingProps
+	v.pendingProps = nil
+	v.mu.Unlock()
+
+	if len(pending) == 0 {
+		return nil
+	}
+
+	if err := v.producer.SendBatch(kafka.TopicPropagation, pending); err != nil {
+		// Put messages back on failure so they can be retried
+		v.mu.Lock()
+		v.pendingProps = append(pending, v.pendingProps...)
+		v.mu.Unlock()
+		return fmt.Errorf("batch publishing to propagation: %w", err)
+	}
+
 	return nil
 }

@@ -21,6 +21,7 @@ type Config struct {
 	MerkleService MerkleServiceConfig `mapstructure:"merkle_service"`
 	P2P           P2PConfig           `mapstructure:"p2p"`
 	Health        HealthConfig        `mapstructure:"health"`
+	Propagation   PropagationConfig   `mapstructure:"propagation"`
 }
 
 type API struct {
@@ -57,6 +58,10 @@ type P2PConfig struct {
 
 type HealthConfig struct {
 	Port int `mapstructure:"port"`
+}
+
+type PropagationConfig struct {
+	MerkleConcurrency int `mapstructure:"merkle_concurrency"`
 }
 
 func BindFlags(cmd *cobra.Command) {
@@ -116,6 +121,7 @@ func setDefaults() {
 	viper.SetDefault("aerospike.batch_size", 500)
 	viper.SetDefault("aerospike.pool_size", 256)
 	viper.SetDefault("health.port", 8081)
+	viper.SetDefault("propagation.merkle_concurrency", 10)
 }
 
 func validate(cfg *Config) error {

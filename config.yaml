@@ -6,9 +6,9 @@
 # Service mode: all, api-server, p2p-client, block-processor, bump-builder, tx-validator, propagation
 mode: all
 
-log_level: info
+log_level: debug
 
-# callback_url: "https://example.com/callback"
+callback_url: "https://rearden-steel.ngrok.app/api/v1/merkle-service/callback"
 # callback_token: "your-callback-token"
 
 api:

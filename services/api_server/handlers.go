@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
+	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
 
 const docsTemplate = `<!DOCTYPE html>
@@ -90,6 +91,7 @@ func (s *Server) handleCallback(c *gin.Context) {
 	logger := s.logger.With(
 		zap.String("type", string(msg.Type)),
 		zap.String("txid", msg.TxID),
+		zap.Strings("txids", msg.TxIDs),
 		zap.String("blockHash", msg.BlockHash),
 	)
 
@@ -97,8 +99,7 @@ func (s *Server) handleCallback(c *gin.Context) {
 	case models.CallbackSeenOnNetwork:
 		s.handleSeenOnNetwork(c, msg, logger)
 	case models.CallbackSeenMultipleNodes:
-		// Just publish event, no state change needed
-		logger.Debug("seen by multiple nodes")
+		s.handleSeenMultipleNodes(c, msg, logger)
 	case models.CallbackStump:
 		s.handleStump(c, msg, logger)
 	case models.CallbackBlockProcessed:
@@ -130,6 +131,30 @@ func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage,
 		}
 		if s.txTracker != nil {
 			s.txTracker.UpdateStatus(txid, models.StatusSeenOnNetwork)
+		}
+	}
+}
+
+func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
+	txids := msg.ResolveSeenTxIDs()
+	if len(txids) == 0 {
+		return
+	}
+
+	ctx := c.Request.Context()
+	now := time.Now()
+	for _, txid := range txids {
+		status := &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusSeenMultipleNodes,
+			Timestamp: now,
+		}
+		if err := s.store.UpdateStatus(ctx, status); err != nil {
+			logger.Warn("failed to update seen_multiple_nodes", zap.String("txid", txid), zap.Error(err))
+			continue
+		}
+		if s.txTracker != nil {
+			s.txTracker.UpdateStatus(txid, models.StatusSeenMultipleNodes)
 		}
 	}
 }
@@ -168,6 +193,7 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 	}
 	if err := s.store.InsertStump(ctx, stump); err != nil {
 		logger.Error("failed to store STUMP", zap.Error(err))
+		return
 	}
 
 	// Publish to Kafka for downstream processing
@@ -266,4 +292,65 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{"status": "submitted"})
+}
+
+// handleSubmitTransactions accepts a batch of concatenated raw transactions.
+func (s *Server) handleSubmitTransactions(c *gin.Context) {
+	if !strings.Contains(c.ContentType(), "octet-stream") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Content-Type must be application/octet-stream"})
+		return
+	}
+
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+	if len(body) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "empty body"})
+		return
+	}
+
+	// Phase 1: Parse all transactions upfront
+	var msgs []kafka.KeyValue
+	offset := 0
+	for offset < len(body) {
+		_, bytesUsed, parseErr := sdkTx.NewTransactionFromStream(body[offset:])
+		if parseErr != nil {
+			s.logger.Error("failed to parse transaction in batch",
+				zap.Int("offset", offset),
+				zap.Int("parsed", len(msgs)),
+				zap.Error(parseErr),
+			)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to parse transaction", "parsed": len(msgs)})
+			return
+		}
+		if bytesUsed == 0 {
+			break
+		}
+
+		rawTxBytes := body[offset : offset+bytesUsed]
+		msgs = append(msgs, kafka.KeyValue{
+			Key: "",
+			Value: map[string]interface{}{
+				"action": "submit",
+				"raw_tx": hex.EncodeToString(rawTxBytes),
+			},
+		})
+		offset += bytesUsed
+	}
+
+	if len(msgs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no transactions parsed"})
+		return
+	}
+
+	// Phase 2: Batch publish all parsed transactions in one call
+	if err := s.producer.SendBatch(kafka.TopicTransaction, msgs); err != nil {
+		s.logger.Error("failed to publish transaction batch", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to submit"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"submitted": len(msgs)})
 }

@@ -41,6 +41,13 @@ var routeDocs = []RouteDoc{
 	},
 	{
 		Method:         "POST",
+		Path:           "/txs",
+		Description:    "Submit a batch of transactions",
+		RequestFormat:  "application/octet-stream (concatenated raw tx bytes)",
+		ResponseFormat: `{"submitted": N} (200 OK)`,
+	},
+	{
+		Method:         "POST",
 		Path:           "/api/v1/merkle-service/callback",
 		Description:    "Receive callbacks from Merkle Service",
 		RequestFormat:  "JSON CallbackMessage with type field. Optional Bearer token auth.",
@@ -57,4 +64,5 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	r.POST("/api/v1/merkle-service/callback", s.handleCallback)
 	r.GET("/tx/:txid", s.handleGetTransaction)
 	r.POST("/tx", s.handleSubmitTransaction)
+	r.POST("/txs", s.handleSubmitTransactions)
 }

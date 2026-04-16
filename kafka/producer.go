@@ -82,6 +82,38 @@ func (p *Producer) SendAsync(topic string, key string, value any) error {
 	return nil
 }
 
+// KeyValue represents a single message in a batch publish.
+type KeyValue struct {
+	Key   string
+	Value any
+}
+
+// SendBatch publishes multiple messages to the same topic in a single batch call.
+func (p *Producer) SendBatch(topic string, msgs []KeyValue) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	saramaMsgs := make([]*sarama.ProducerMessage, 0, len(msgs))
+	for _, m := range msgs {
+		data, err := json.Marshal(m.Value)
+		if err != nil {
+			return fmt.Errorf("marshaling batch message: %w", err)
+		}
+		saramaMsgs = append(saramaMsgs, &sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(m.Key),
+			Value: sarama.ByteEncoder(data),
+		})
+	}
+
+	if err := p.syncProducer.SendMessages(saramaMsgs); err != nil {
+		return fmt.Errorf("sending batch to %s: %w", topic, err)
+	}
+
+	return nil
+}
+
 // Close shuts down both producers.
 func (p *Producer) Close() error {
 	var errs []error

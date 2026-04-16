@@ -81,6 +81,9 @@ type Store interface {
 	// DeleteStumpsByBlockHash removes all STUMPs for a given block hash (used during reorg cleanup).
 	DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error
 
+	// EnsureIndexes creates any required secondary indexes for query operations.
+	EnsureIndexes() error
+
 	// Close closes the database connection
 	Close() error
 }

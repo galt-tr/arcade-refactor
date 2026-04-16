@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/IBM/sarama"
 	"go.uber.org/zap"
@@ -18,6 +19,7 @@ type ConsumerGroup struct {
 	group      sarama.ConsumerGroup
 	topics     []string
 	handler    MessageHandler
+	flushFunc  func() error
 	producer   *Producer
 	maxRetries int
 	logger     *zap.Logger
@@ -29,6 +31,7 @@ type ConsumerConfig struct {
 	GroupID    string
 	Topics     []string
 	Handler    MessageHandler
+	FlushFunc  func() error // called when claim channel drains or session ends
 	Producer   *Producer
 	MaxRetries int
 	Logger     *zap.Logger
@@ -53,6 +56,7 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 		group:      group,
 		topics:     cfg.Topics,
 		handler:    cfg.Handler,
+		flushFunc:  cfg.FlushFunc,
 		producer:   cfg.Producer,
 		maxRetries: maxRetries,
 		logger:     cfg.Logger,
@@ -98,19 +102,51 @@ func (c *ConsumerGroup) Cleanup(sarama.ConsumerGroupSession) error {
 }
 
 // ConsumeClaim processes messages from a partition claim.
+// Uses a drain-then-flush pattern: processes all immediately available messages,
+// then flushes. This naturally batches messages that arrived together (e.g., from
+// a batch publish) without requiring a configured batch size or timer.
 func (c *ConsumerGroup) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	defer c.flush()
 	for {
 		select {
 		case msg, ok := <-claim.Messages():
 			if !ok {
 				return nil
 			}
-			if err := c.processWithRetry(session.Context(), msg); err != nil {
-				c.sendToDLQ(msg, err)
+			c.processOne(session, msg)
+
+			// Drain all immediately-ready messages before flushing
+			for {
+				select {
+				case msg, ok := <-claim.Messages():
+					if !ok {
+						return nil
+					}
+					c.processOne(session, msg)
+				default:
+					goto drain_done
+				}
 			}
-			session.MarkMessage(msg, "")
+		drain_done:
+			c.flush()
+
 		case <-session.Context().Done():
 			return nil
+		}
+	}
+}
+
+func (c *ConsumerGroup) processOne(session sarama.ConsumerGroupSession, msg *sarama.ConsumerMessage) {
+	if err := c.processWithRetry(session.Context(), msg); err != nil {
+		c.sendToDLQ(msg, err)
+	}
+	session.MarkMessage(msg, "")
+}
+
+func (c *ConsumerGroup) flush() {
+	if c.flushFunc != nil {
+		if err := c.flushFunc(); err != nil {
+			c.logger.Error("flush failed", zap.Error(err))
 		}
 	}
 }
@@ -118,6 +154,14 @@ func (c *ConsumerGroup) ConsumeClaim(session sarama.ConsumerGroupSession, claim 
 func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *sarama.ConsumerMessage) error {
 	var lastErr error
 	for attempt := 0; attempt < c.maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * 100 * time.Millisecond
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return lastErr
+			}
+		}
 		if err := c.handler(ctx, msg); err != nil {
 			lastErr = err
 			c.logger.Warn("message processing failed, retrying",
