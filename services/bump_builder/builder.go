@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/IBM/sarama"
 	"go.uber.org/zap"
@@ -16,12 +17,11 @@ import (
 )
 
 type Builder struct {
-	cfg           *config.Config
-	logger        *zap.Logger
-	store         store.Store
-	consumer      *kafka.ConsumerGroup
-	producer      *kafka.Producer
-	stumpConsumer *StumpConsumer
+	cfg      *config.Config
+	logger   *zap.Logger
+	store    store.Store
+	consumer *kafka.ConsumerGroup
+	producer *kafka.Producer
 }
 
 func New(cfg *config.Config, logger *zap.Logger, st store.Store) *Builder {
@@ -55,22 +55,9 @@ func (b *Builder) Start(ctx context.Context) error {
 	}
 	b.consumer = consumer
 
-	// Start the STUMP consumer in a goroutine
-	stumpConsumer, err := NewStumpConsumer(
-		b.cfg.Kafka.Brokers,
-		b.cfg.Kafka.ConsumerGroup,
-		b.producer,
-		b.cfg.Kafka.MaxRetries,
-		b.logger,
-		b.store,
+	b.logger.Info("bump builder started",
+		zap.Int("grace_window_ms", b.cfg.BumpBuilder.GraceWindowMs),
 	)
-	if err != nil {
-		return fmt.Errorf("creating stump consumer: %w", err)
-	}
-	b.stumpConsumer = stumpConsumer
-	go stumpConsumer.Run(ctx)
-
-	b.logger.Info("bump builder started")
 	return consumer.Run(ctx)
 }
 
@@ -79,11 +66,6 @@ func (b *Builder) Stop() error {
 	var errs []error
 	if b.consumer != nil {
 		if err := b.consumer.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if b.stumpConsumer != nil {
-		if err := b.stumpConsumer.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -111,6 +93,18 @@ func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage
 
 	logger := b.logger.With(zap.String("block_hash", blockHash))
 
+	// Grace window: merkle-service's stumpGate only waits for the first HTTP attempt
+	// of each STUMP before releasing BLOCK_PROCESSED. STUMPs that got a 5xx on the
+	// first attempt retry asynchronously and may land after BLOCK_PROCESSED.
+	if grace := time.Duration(b.cfg.BumpBuilder.GraceWindowMs) * time.Millisecond; grace > 0 {
+		logger.Debug("waiting grace window", zap.Duration("duration", grace))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(grace):
+		}
+	}
+
 	// 1. Get all STUMPs for this block
 	stumps, err := b.store.GetStumpsByBlockHash(ctx, blockHash)
 	if err != nil {
@@ -118,7 +112,8 @@ func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage
 	}
 
 	if len(stumps) == 0 {
-		return fmt.Errorf("no STUMPs found for block %s, may not be stored yet", blockHash)
+		logger.Info("no STUMPs found — block has no tracked transactions, skipping BUMP construction")
+		return nil
 	}
 
 	logger.Info("building compound BUMP", zap.Int("stump_count", len(stumps)))
@@ -136,7 +131,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage
 		return nil
 	}
 
-	// 3. Build compound BUMP
+	// 3. Build compound BUMP (STUMPs are sparse — only for subtrees with tracked txs)
 	compound, txids, err := bump.BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP)
 	if err != nil {
 		return fmt.Errorf("building compound BUMP: %w", err)

@@ -97,17 +97,18 @@ func (s *Server) handleCallback(c *gin.Context) {
 	switch msg.Type {
 	case models.CallbackSeenOnNetwork:
 		s.handleSeenOnNetwork(c, msg, logger)
+		c.Status(http.StatusOK)
 	case models.CallbackSeenMultipleNodes:
 		s.handleSeenMultipleNodes(c, msg, logger)
+		c.Status(http.StatusOK)
 	case models.CallbackStump:
 		s.handleStump(c, msg, logger)
 	case models.CallbackBlockProcessed:
-		s.handleBlockProcessed(msg, logger)
+		s.handleBlockProcessed(c, msg, logger)
 	default:
 		logger.Warn("unknown callback type")
+		c.Status(http.StatusOK)
 	}
-
-	c.Status(http.StatusOK)
 }
 
 func (s *Server) handleSeenOnNetwork(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
@@ -161,35 +162,39 @@ func (s *Server) handleSeenMultipleNodes(c *gin.Context, msg models.CallbackMess
 func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
 	if msg.BlockHash == "" || len(msg.Stump) == 0 {
 		logger.Warn("incomplete STUMP callback")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "blockHash and stump are required"})
 		return
 	}
 
-	ctx := c.Request.Context()
-
-	// Store STUMP keyed by (blockHash, subtreeIndex)
+	// Store STUMP keyed by (blockHash, subtreeIndex). Synchronous write so that
+	// a 200 to merkle-service is a durability guarantee — merkle-service only
+	// fires BLOCK_PROCESSED after all STUMPs succeed, so the bump builder can
+	// then rely on finding them all in Aerospike.
 	stump := &models.Stump{
 		BlockHash:    msg.BlockHash,
 		SubtreeIndex: msg.SubtreeIndex,
 		StumpData:    msg.Stump,
 	}
-	if err := s.store.InsertStump(ctx, stump); err != nil {
+	if err := s.store.InsertStump(c.Request.Context(), stump); err != nil {
 		logger.Error("failed to store STUMP", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store stump"})
 		return
 	}
 
-	// Publish to Kafka for downstream processing
-	if err := s.producer.Send(kafka.TopicStump, msg.BlockHash, msg); err != nil {
-		logger.Error("failed to publish STUMP to kafka", zap.Error(err))
-	}
+	c.Status(http.StatusOK)
 }
 
-func (s *Server) handleBlockProcessed(msg models.CallbackMessage, logger *zap.Logger) {
+func (s *Server) handleBlockProcessed(c *gin.Context, msg models.CallbackMessage, logger *zap.Logger) {
 	if msg.BlockHash == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "blockHash is required"})
 		return
 	}
 	if err := s.producer.Send(kafka.TopicBlockProcessed, msg.BlockHash, msg); err != nil {
 		logger.Error("failed to publish block_processed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enqueue"})
+		return
 	}
+	c.Status(http.StatusOK)
 }
 
 // handleGetTransaction retrieves a transaction status by TXID.

@@ -22,6 +22,7 @@ type Config struct {
 	P2P           P2PConfig           `mapstructure:"p2p"`
 	Health        HealthConfig        `mapstructure:"health"`
 	Propagation   PropagationConfig   `mapstructure:"propagation"`
+	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
 }
 
 type API struct {
@@ -67,8 +68,15 @@ type PropagationConfig struct {
 	RetryBufferSize   int `mapstructure:"retry_buffer_size"`
 }
 
+// BumpBuilderConfig controls the BUMP construction workflow. GraceWindowMs is the
+// delay applied after receiving BLOCK_PROCESSED before reading STUMPs from the store,
+// giving merkle-service retries time to land for any STUMPs that initially got a 5xx.
+type BumpBuilderConfig struct {
+	GraceWindowMs int `mapstructure:"grace_window_ms"`
+}
+
 func BindFlags(cmd *cobra.Command) {
-	cmd.Flags().String("mode", "all", "Service mode: all, api-server, p2p-client, block-processor, bump-builder, tx-validator, propagation")
+	cmd.Flags().String("mode", "all", "Service mode: all, api-server, bump-builder, tx-validator, propagation")
 	cmd.Flags().String("config", "", "Path to config file")
 	cmd.Flags().String("log-level", "info", "Log level: debug, info, warn, error")
 	_ = viper.BindPFlag("mode", cmd.Flags().Lookup("mode"))
@@ -128,6 +136,7 @@ func setDefaults() {
 	viper.SetDefault("propagation.retry_max_attempts", 5)
 	viper.SetDefault("propagation.retry_backoff_ms", 500)
 	viper.SetDefault("propagation.retry_buffer_size", 10000)
+	viper.SetDefault("bump_builder.grace_window_ms", 30000)
 }
 
 func validate(cfg *Config) error {
@@ -138,8 +147,8 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("aerospike.hosts is required")
 	}
 	validModes := map[string]bool{
-		"all": true, "api-server": true, "p2p-client": true,
-		"block-processor": true, "bump-builder": true,
+		"all": true, "api-server": true,
+		"bump-builder": true,
 		"tx-validator": true, "propagation": true,
 	}
 	if !validModes[cfg.Mode] {

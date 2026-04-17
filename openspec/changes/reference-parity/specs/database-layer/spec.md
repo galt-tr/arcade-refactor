@@ -33,13 +33,6 @@ BUMPs SHALL be stored as BRC-74 binary data (not JSON). The store SHALL provide 
 - **WHEN** a compound BUMP is stored as binary bytes
 - **THEN** `GetBUMP` SHALL return the exact same bytes
 
-### Requirement: Block tracking
-The store SHALL track processed blocks with `MarkBlockProcessed(ctx, blockHash, blockHeight, onChain)`, `IsBlockOnChain(ctx, blockHash)`, and `MarkBlockOffChain(ctx, blockHash)` for reorg handling.
-
-#### Scenario: Mark block processed
-- **WHEN** `MarkBlockProcessed(ctx, "hash", 800000, true)` is called
-- **THEN** `IsBlockOnChain(ctx, "hash")` SHALL return `(true, nil)`
-
 ### Requirement: Submission tracking
 The store SHALL track client submissions with `InsertSubmission(ctx, sub)`, `GetSubmissionsByTxID(ctx, txid)`, and `GetSubmissionsByToken(ctx, token)` for webhook delivery.
 

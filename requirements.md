@@ -42,20 +42,17 @@ See [swimlane diagram](./diagram.png) for more details on how the integration wi
   - publishes to kafka
   - teranode libp2p client (see [message bus](https://github.com/bsv-blockchain/go-p2p-message-bus) and [teranode client](https://github.com/bsv-blockchain/go-teranode-p2p-client) for references)
 - kafka
-  - topics (review these):
-    - block (from p2p)
-    - stump
-    - block_processed
+  - topics:
+    - block_processed (fanned out to bump_builder consumer group)
     - transaction
+    - propagation
 - database
   - store transactions and their respective states
   - must scale really well
-  - store stumps as they come in (with proper pruning when a bump is built)
+  - store stumps as they come in (synchronously, so merkle-service 2xx = durability) with proper pruning when a bump is built
   - stores bumps and udpates transactions with specific merkle proofs.
-- block_processor
-  - when p2p client sees a block, fetch it from the relevant datahub URL and store full block model
 - bump_builder
-  - when a BLOCK_PROCESSED callback is issued, find all STUMPs received for that block and build a full BUMP using the coinbase merkle path. Store merkle paths for each transaction
+  - when a BLOCK_PROCESSED callback is issued, find all STUMPs received for that block and build a full BUMP using the coinbase merkle path. Store merkle paths for each transaction. Waits a configurable grace window before reading STUMPs so late-retry deliveries from merkle-service can land before BUMP construction.
 - propagation
   - broadcasts transactions to all configured datahub URLs
 - tx_validator

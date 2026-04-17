@@ -17,9 +17,7 @@ import (
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/services/api_server"
-	"github.com/bsv-blockchain/arcade/services/block_processor"
 	"github.com/bsv-blockchain/arcade/services/bump_builder"
-	"github.com/bsv-blockchain/arcade/services/p2p_client"
 	"github.com/bsv-blockchain/arcade/services/propagation"
 	"github.com/bsv-blockchain/arcade/services/tx_validator"
 	"github.com/bsv-blockchain/arcade/store"
@@ -145,13 +143,7 @@ func buildServices(
 	}
 
 	if shouldRun("api-server") {
-			svcs = append(svcs, api_server.New(cfg, logger, producer, aeroStore, txTracker))
-	}
-	if shouldRun("p2p-client") {
-		svcs = append(svcs, p2p_client.New(cfg, logger, producer))
-	}
-	if shouldRun("block-processor") {
-		svcs = append(svcs, block_processor.New(cfg, logger, aeroStore))
+		svcs = append(svcs, api_server.New(cfg, logger, producer, aeroStore, txTracker))
 	}
 	if shouldRun("bump-builder") {
 		svcs = append(svcs, bump_builder.New(cfg, logger, aeroStore))

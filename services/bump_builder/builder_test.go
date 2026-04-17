@@ -258,20 +258,20 @@ func makeMinimalSTUMP(txidHex string) []byte {
 
 // --- Tests ---
 
-func TestBuilder_HandleMessage_NoSTUMPs_ReturnsError(t *testing.T) {
+func TestBuilder_HandleMessage_NoSTUMPs_ReturnsNil(t *testing.T) {
+	// A block with no STUMPs means no tracked transactions in it — this is
+	// legitimate (STUMPs are sparse) and must not return an error or trigger DLQ.
 	ms := newMockStore()
-	// No stumps stored for this block
 	datahub := newDatahubServer([]string{})
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
 
-	err := b.handleMessage(context.Background(), makeBlockProcessedMsg("blockhash123"))
-	if err == nil {
-		t.Fatal("expected error when no STUMPs found, got nil")
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg("blockhash123")); err != nil {
+		t.Fatalf("expected nil when no STUMPs found, got: %v", err)
 	}
-	if !containsStr(err.Error(), "no STUMPs found") {
-		t.Errorf("expected 'no STUMPs found' error, got: %v", err)
+	if len(ms.bumps) != 0 {
+		t.Errorf("expected no BUMP stored, got %d", len(ms.bumps))
 	}
 }
 
@@ -432,10 +432,10 @@ func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
 	}
 }
 
-// TestBuilder_RaceCondition_STUMPsAppearOnRetry simulates the race condition where
-// block_processed arrives before STUMPs are stored. The first call to GetStumpsByBlockHash
-// returns empty (error), but a subsequent retry succeeds.
-func TestBuilder_RaceCondition_STUMPsAppearOnRetry(t *testing.T) {
+// TestBuilder_LateSTUMP_ArrivesDuringGraceWindow simulates a late-retry STUMP that
+// lands after BLOCK_PROCESSED but within the grace window. The builder should wait
+// the grace window, then find the STUMP and build the BUMP successfully.
+func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 	ms := newMockStore()
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
 	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
@@ -445,33 +445,26 @@ func TestBuilder_RaceCondition_STUMPsAppearOnRetry(t *testing.T) {
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
+	b.cfg.BumpBuilder.GraceWindowMs = 100 // short grace for the test
 
-	// First call: no STUMPs yet — should error
-	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
-	if err == nil {
-		t.Fatal("expected error when no STUMPs found")
-	}
+	// Insert STUMP mid-grace-window from another goroutine
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		_ = ms.InsertStump(context.Background(), &models.Stump{
+			BlockHash:    blockHash,
+			SubtreeIndex: 0,
+			StumpData:    makeMinimalSTUMP(txidHex),
+		})
+	}()
 
-	// STUMPs arrive via InsertStump (same path as production stump consumer)
-	stumpData := makeMinimalSTUMP(txidHex)
-	if err := ms.InsertStump(context.Background(), &models.Stump{
-		BlockHash:    blockHash,
-		SubtreeIndex: 0,
-		StumpData:    stumpData,
-	}); err != nil {
-		t.Fatalf("InsertStump failed: %v", err)
-	}
-
-	// Retry: STUMPs now present — should succeed
-	err = b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
-	if err != nil {
-		t.Fatalf("expected success on retry after STUMPs stored, got: %v", err)
+	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
+		t.Fatalf("expected success, got: %v", err)
 	}
 
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	if _, ok := ms.bumps[blockHash]; !ok {
-		t.Error("expected BUMP to be stored on retry")
+		t.Error("expected BUMP to be stored after late STUMP landed in grace window")
 	}
 }
 
@@ -530,88 +523,6 @@ func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
 	// Verify STUMPs were cleaned up
 	if len(ms.deletedBlocks) != 1 || ms.deletedBlocks[0] != blockHash {
 		t.Errorf("expected STUMPs for %s to be deleted, got: %v", blockHash, ms.deletedBlocks)
-	}
-}
-
-// --- Stump Consumer Tests ---
-
-func TestStumpConsumer_HandleMessage_StoresSTUMP(t *testing.T) {
-	ms := newMockStore()
-	sc := &StumpConsumer{
-		logger: zap.NewNop().Named("stump-consumer"),
-		store:  ms,
-	}
-
-	callback := models.CallbackMessage{
-		Type:         models.CallbackStump,
-		BlockHash:    "block123",
-		SubtreeIndex: 2,
-		Stump:        []byte{0x01, 0x02, 0x03},
-	}
-	data, _ := json.Marshal(callback)
-	msg := &sarama.ConsumerMessage{Value: data}
-
-	err := sc.handleMessage(context.Background(), msg)
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-	stumps := ms.stumps["block123"]
-	if len(stumps) != 1 {
-		t.Fatalf("expected 1 stump stored, got %d", len(stumps))
-	}
-	if stumps[0].SubtreeIndex != 2 {
-		t.Errorf("expected subtree index 2, got %d", stumps[0].SubtreeIndex)
-	}
-}
-
-func TestStumpConsumer_HandleMessage_StoreError_ReturnsError(t *testing.T) {
-	ms := newMockStore()
-	ms.insertStumpErr = errors.New("SERVER_MEM_ERROR")
-	sc := &StumpConsumer{
-		logger: zap.NewNop().Named("stump-consumer"),
-		store:  ms,
-	}
-
-	callback := models.CallbackMessage{
-		Type:      models.CallbackStump,
-		BlockHash: "block123",
-		Stump:     []byte{0x01},
-	}
-	data, _ := json.Marshal(callback)
-	msg := &sarama.ConsumerMessage{Value: data}
-
-	err := sc.handleMessage(context.Background(), msg)
-	if err == nil {
-		t.Fatal("expected error from InsertStump, got nil")
-	}
-}
-
-func TestStumpConsumer_HandleMessage_MissingFields_ReturnsError(t *testing.T) {
-	sc := &StumpConsumer{
-		logger: zap.NewNop().Named("stump-consumer"),
-		store:  newMockStore(),
-	}
-
-	tests := []struct {
-		name string
-		msg  models.CallbackMessage
-	}{
-		{"missing block hash", models.CallbackMessage{Stump: []byte{0x01}}},
-		{"missing stump data", models.CallbackMessage{BlockHash: "abc"}},
-		{"both missing", models.CallbackMessage{}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			data, _ := json.Marshal(tt.msg)
-			err := sc.handleMessage(context.Background(), &sarama.ConsumerMessage{Value: data})
-			if err == nil {
-				t.Error("expected error for missing fields")
-			}
-		})
 	}
 }
 

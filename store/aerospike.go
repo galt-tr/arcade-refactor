@@ -541,43 +541,6 @@ func (s *AerospikeStore) UpdateDeliveryStatus(_ context.Context, submissionID st
 
 // --- Block Tracking Operations ---
 
-func (s *AerospikeStore) IsBlockOnChain(_ context.Context, blockHash string) (bool, error) {
-	key, err := s.key(setProcessedBlocks, blockHash)
-	if err != nil {
-		return false, err
-	}
-	rec, err := s.client.Get(nil, key, "on_chain")
-	if err != nil && !isKeyNotFound(err) {
-		return false, err
-	}
-	if rec == nil {
-		return false, nil
-	}
-	if v, ok := rec.Bins["on_chain"]; ok {
-		if b, ok := v.(int); ok {
-			return b == 1, nil
-		}
-	}
-	return false, nil
-}
-
-func (s *AerospikeStore) MarkBlockProcessed(_ context.Context, blockHash string, blockHeight uint64, onChain bool) error {
-	key, err := s.key(setProcessedBlocks, blockHash)
-	if err != nil {
-		return err
-	}
-	onChainVal := 0
-	if onChain {
-		onChainVal = 1
-	}
-	bins := aero.BinMap{
-		"block_hash":   blockHash,
-		"block_height": int(blockHeight),
-		"on_chain":     onChainVal,
-	}
-	return s.client.Put(nil, key, bins)
-}
-
 func (s *AerospikeStore) HasAnyProcessedBlocks(_ context.Context) (bool, error) {
 	stmt := aero.NewStatement(s.namespace, setProcessedBlocks)
 	rs, err := s.client.Query(nil, stmt)

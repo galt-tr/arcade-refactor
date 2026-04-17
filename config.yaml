@@ -3,7 +3,7 @@
 # All values can be overridden with ARCADE_ prefixed env vars
 # (e.g. ARCADE_LOG_LEVEL, ARCADE_KAFKA_BROKERS).
 
-# Service mode: all, api-server, p2p-client, block-processor, bump-builder, tx-validator, propagation
+# Service mode: all, api-server, bump-builder, tx-validator, propagation
 mode: all
 
 log_level: debug

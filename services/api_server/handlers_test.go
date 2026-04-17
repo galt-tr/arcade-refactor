@@ -90,13 +90,6 @@ func (m *mockStore) GetSubmissionsByToken(context.Context, string) ([]*models.Su
 func (m *mockStore) UpdateDeliveryStatus(context.Context, string, models.Status, int, *time.Time) error {
 	return nil
 }
-func (m *mockStore) IsBlockOnChain(context.Context, string) (bool, error)    { return false, nil }
-func (m *mockStore) MarkBlockProcessed(context.Context, string, uint64, bool) error { return nil }
-func (m *mockStore) HasAnyProcessedBlocks(context.Context) (bool, error)     { return false, nil }
-func (m *mockStore) GetOnChainBlockAtHeight(context.Context, uint64) (string, bool, error) {
-	return "", false, nil
-}
-func (m *mockStore) MarkBlockOffChain(context.Context, string) error         { return nil }
 func (m *mockStore) InsertStump(context.Context, *models.Stump) error        { return m.insertStumpErr }
 func (m *mockStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stump, error) {
 	return nil, nil
@@ -291,7 +284,10 @@ func TestHandleCallback_SeenMultipleNodes_UpdatesStatus(t *testing.T) {
 	}
 }
 
-func TestHandleCallback_Stump_StorageError_DoesNotPublishToKafka(t *testing.T) {
+func TestHandleCallback_Stump_StorageError_Returns500(t *testing.T) {
+	// When STUMP storage fails, we MUST return 5xx so merkle-service retries.
+	// Swallowing the error with a 200 breaks the bump_builder's invariant that
+	// every STUMP in a BLOCK_PROCESSED block is durably stored in Aerospike.
 	mock := &mockSyncProducer{}
 	ms := &mockStore{insertStumpErr: errors.New("SERVER_MEM_ERROR")}
 	_, router := setupServerWithStore(mock, ms)
@@ -309,11 +305,9 @@ func TestHandleCallback_Stump_StorageError_DoesNotPublishToKafka(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
 	}
-
-	// No messages should have been published to Kafka since storage failed
 	if len(mock.messages) != 0 {
 		t.Errorf("expected 0 Kafka messages after storage failure, got %d", len(mock.messages))
 	}
