@@ -38,7 +38,9 @@ type Store interface {
 	GetBUMP(ctx context.Context, blockHash string) (blockHeight uint64, bumpData []byte, err error)
 
 	// SetMinedByTxIDs marks transactions as mined for a given block hash and tx list.
-	// Returns full status objects for all affected transactions.
+	// Implementations must only update records that already exist in the store;
+	// txids with no existing record should be silently skipped (not created).
+	// Returns full status objects only for the transactions that were actually updated.
 	SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error)
 
 	// InsertSubmission creates a new submission record

@@ -100,11 +100,14 @@ func (p *Producer) SendBatch(topic string, msgs []KeyValue) error {
 		if err != nil {
 			return fmt.Errorf("marshaling batch message: %w", err)
 		}
-		saramaMsgs = append(saramaMsgs, &sarama.ProducerMessage{
+		msg := &sarama.ProducerMessage{
 			Topic: topic,
-			Key:   sarama.StringEncoder(m.Key),
 			Value: sarama.ByteEncoder(data),
-		})
+		}
+		if m.Key != "" {
+			msg.Key = sarama.StringEncoder(m.Key)
+		}
+		saramaMsgs = append(saramaMsgs, msg)
 	}
 
 	if err := p.syncProducer.SendMessages(saramaMsgs); err != nil {

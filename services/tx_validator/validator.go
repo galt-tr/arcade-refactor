@@ -155,7 +155,6 @@ func (v *Validator) handleNewTransaction(ctx context.Context, msg txMessage) err
 	// so the batch naturally matches what the client submitted.
 	v.mu.Lock()
 	v.pendingProps = append(v.pendingProps, kafka.KeyValue{
-		Key:   txid,
 		Value: map[string]string{"txid": txid, "raw_tx": msg.RawTx},
 	})
 	v.mu.Unlock()
