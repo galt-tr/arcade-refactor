@@ -68,6 +68,14 @@ func run(cmd *cobra.Command, _ []string) error {
 	// Create shared components
 	txTracker := store.NewTxTracker()
 
+	// Load tracked transactions from Aerospike so split microservices
+	// (especially bump-builder) know which txids to match against.
+	if loaded, err := txTracker.LoadFromStore(context.Background(), aeroStore, 0); err != nil {
+		logger.Warn("failed to load tx tracker from store", zap.Error(err))
+	} else if loaded > 0 {
+		logger.Info("loaded tracked transactions from store", zap.Int("count", loaded))
+	}
+
 	teranodeClient := teranode.NewClient(cfg.DatahubURLs, cfg.Teranode.AuthToken)
 
 	var merkleClient *merkleservice.Client
