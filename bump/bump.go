@@ -10,7 +10,6 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
 )
 
 // AssembleBUMP constructs a minimal BUMP (block-level merkle proof) from a STUMP
@@ -306,7 +305,7 @@ func ExtractLevel0Hashes(stumpData []byte) []chainhash.Hash {
 // BuildCompoundBUMP merges multiple per-subtree BUMPs into a single compound MerklePath
 // containing all tracked transactions at level 0. The tracker is used to discover
 // which level-0 hashes are tracked transactions.
-func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte, tracker *store.TxTracker) (*transaction.MerklePath, []string, error) {
+func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) (*transaction.MerklePath, []string, error) {
 	if len(stumps) == 0 {
 		return nil, nil, fmt.Errorf("no stumps to build compound BUMP")
 	}
@@ -338,13 +337,10 @@ func BuildCompoundBUMP(stumps []*models.Stump, subtreeHashes []chainhash.Hash, c
 		}
 		blockHeight = fullPath.BlockHeight
 
-		// Discover tracked txids from level-0 hashes
-		level0 := ExtractLevel0Hashes(stump.StumpData)
-		if tracker != nil {
-			tracked := tracker.FilterTrackedHashes(level0)
-			for _, h := range tracked {
-				txids = append(txids, h.String())
-			}
+		// Collect all level-0 hashes as candidate txids.
+		// The caller's store will filter to only those that are tracked.
+		for _, h := range ExtractLevel0Hashes(stump.StumpData) {
+			txids = append(txids, h.String())
 		}
 
 		allPaths = append(allPaths, fullPath)

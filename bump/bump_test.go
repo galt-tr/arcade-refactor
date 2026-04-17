@@ -10,7 +10,6 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/bsv-blockchain/arcade/models"
-	"github.com/bsv-blockchain/arcade/store"
 )
 
 // --- Test Helpers ---
@@ -766,14 +765,7 @@ func TestBuildCompoundBUMP_AllTxsExtractable(t *testing.T) {
 		{BlockHash: "blockhash", SubtreeIndex: 1, StumpData: stump1},
 	}
 
-	tracker := store.NewTxTracker()
-	for s := range 2 {
-		for i := range 4 {
-			tracker.AddHash(allLeaves[s][i], models.StatusSeenOnNetwork)
-		}
-	}
-
-	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, tracker)
+	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -853,17 +845,9 @@ func TestBuildCompoundBUMP_CoinbaseReplacement(t *testing.T) {
 		{BlockHash: "block1", SubtreeIndex: 1, StumpData: stump1},
 	}
 
-	tracker := store.NewTxTracker()
-	for s := range 2 {
-		for i := range 4 {
-			tracker.AddHash(allLeaves[s][i], models.StatusSeenOnNetwork)
-		}
-	}
-	tracker.AddHash(coinbaseTxID, models.StatusSeenOnNetwork)
-
 	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000000)
 
-	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP, tracker)
+	compound, txids, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -930,15 +914,9 @@ func TestBuildCompoundBUMP_CoinbaseReplacement_SingleSubtree(t *testing.T) {
 		{BlockHash: "block2", SubtreeIndex: 0, StumpData: stump0},
 	}
 
-	tracker := store.NewTxTracker()
-	for i := range 4 {
-		tracker.AddHash(allLeaves[0][i], models.StatusSeenOnNetwork)
-	}
-	tracker.AddHash(coinbaseTxID, models.StatusSeenOnNetwork)
-
 	cbBUMP := buildCoinbaseBUMP(allLeaves[0], coinbaseTxID, 1000001)
 
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP, tracker)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1065,14 +1043,7 @@ func TestExtractMinimalPathForTx_AllTxsExtractable(t *testing.T) {
 		{BlockHash: "blockhash", SubtreeIndex: 1, StumpData: stump1},
 	}
 
-	tracker := store.NewTxTracker()
-	for s := range 2 {
-		for i := range 4 {
-			tracker.AddHash(allLeaves[s][i], models.StatusSeenOnNetwork)
-		}
-	}
-
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil, tracker)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}
@@ -1113,12 +1084,7 @@ func TestExtractMinimalPathForTx_TxNotFound(t *testing.T) {
 		{BlockHash: "blockhash", SubtreeIndex: 0, StumpData: stump0},
 	}
 
-	tracker := store.NewTxTracker()
-	for i := range 4 {
-		tracker.AddHash(allLeaves[0][i], models.StatusSeenOnNetwork)
-	}
-
-	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes[:1], nil, tracker)
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes[:1], nil)
 	if err != nil {
 		t.Fatalf("BuildCompoundBUMP failed: %v", err)
 	}

@@ -11,7 +11,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
@@ -166,26 +165,6 @@ func (s *Server) handleStump(c *gin.Context, msg models.CallbackMessage, logger 
 	}
 
 	ctx := c.Request.Context()
-
-	// Extract level-0 hashes from STUMP to discover tracked transactions
-	level0Hashes := bump.ExtractLevel0Hashes(msg.Stump)
-	if s.txTracker != nil && len(level0Hashes) > 0 {
-		tracked := s.txTracker.FilterTrackedHashes(level0Hashes)
-		now := time.Now()
-		for _, hash := range tracked {
-			txid := hash.String()
-			status := &models.TransactionStatus{
-				TxID:      txid,
-				Status:    models.StatusStumpProcessing,
-				BlockHash: msg.BlockHash,
-				Timestamp: now,
-			}
-			if err := s.store.UpdateStatus(ctx, status); err != nil {
-				logger.Warn("failed to update stump_processing status", zap.String("txid", txid), zap.Error(err))
-			}
-			s.txTracker.UpdateStatus(txid, models.StatusStumpProcessing)
-		}
-	}
 
 	// Store STUMP keyed by (blockHash, subtreeIndex)
 	stump := &models.Stump{

@@ -218,15 +218,14 @@ func newFailingDatahubServer() *httptest.Server {
 	}))
 }
 
-func newTestBuilder(st store.Store, datahubURL string, tracker *store.TxTracker) *Builder {
+func newTestBuilder(st store.Store, datahubURL string) *Builder {
 	cfg := &config.Config{
 		DatahubURLs: []string{datahubURL},
 	}
 	return &Builder{
-		cfg:       cfg,
-		logger:    zap.NewNop().Named("bump-builder"),
-		store:     st,
-		txTracker: tracker,
+		cfg:    cfg,
+		logger: zap.NewNop().Named("bump-builder"),
+		store:  st,
 	}
 }
 
@@ -265,7 +264,7 @@ func TestBuilder_HandleMessage_NoSTUMPs_ReturnsError(t *testing.T) {
 	datahub := newDatahubServer([]string{})
 	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL, nil)
+	b := newTestBuilder(ms, datahub.URL)
 
 	err := b.handleMessage(context.Background(), makeBlockProcessedMsg("blockhash123"))
 	if err == nil {
@@ -283,7 +282,7 @@ func TestBuilder_HandleMessage_GetStumpsError_Propagated(t *testing.T) {
 	datahub := newDatahubServer(nil)
 	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL, nil)
+	b := newTestBuilder(ms, datahub.URL)
 
 	err := b.handleMessage(context.Background(), makeBlockProcessedMsg("blockhash123"))
 	if err == nil {
@@ -303,7 +302,7 @@ func TestBuilder_HandleMessage_DatahubFailure_ReturnsError(t *testing.T) {
 	datahub := newFailingDatahubServer()
 	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL, nil)
+	b := newTestBuilder(ms, datahub.URL)
 
 	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
 	if err == nil {
@@ -329,7 +328,7 @@ func TestBuilder_HandleMessage_InsertBUMPError_ReturnsError(t *testing.T) {
 	datahub := newDatahubServer([]string{subtreeHash})
 	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL, nil)
+	b := newTestBuilder(ms, datahub.URL)
 
 	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
 	if err == nil {
@@ -353,7 +352,7 @@ func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
 	datahub := newDatahubServer([]string{subtreeHash})
 	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL, nil)
+	b := newTestBuilder(ms, datahub.URL)
 
 	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
 	if err != nil {
@@ -385,18 +384,14 @@ func TestBuilder_HandleMessage_HappyPath_WithTracker(t *testing.T) {
 	datahub := newDatahubServer([]string{subtreeHash})
 	defer datahub.Close()
 
-	tracker := store.NewTxTracker()
-	tracker.Add(txidHex, models.StatusSeenOnNetwork)
-
-	b := newTestBuilder(ms, datahub.URL, tracker)
+	b := newTestBuilder(ms, datahub.URL)
 
 	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	// Verify BUMP was stored and STUMPs pruned (tracker integration is best-effort;
-	// whether SetMinedByTxIDs is called depends on STUMP binary format matching tracker hashes)
+	// Verify BUMP was stored and STUMPs pruned
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	if _, ok := ms.bumps[blockHash]; !ok {
@@ -412,7 +407,7 @@ func TestBuilder_HandleMessage_EmptyBlockHash_ReturnsError(t *testing.T) {
 	datahub := newDatahubServer(nil)
 	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL, nil)
+	b := newTestBuilder(ms, datahub.URL)
 
 	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(""))
 	if err == nil {
@@ -425,7 +420,7 @@ func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
 	datahub := newDatahubServer(nil)
 	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL, nil)
+	b := newTestBuilder(ms, datahub.URL)
 
 	msg := &sarama.ConsumerMessage{
 		Topic: "arcade.block_processed",
@@ -449,7 +444,7 @@ func TestBuilder_RaceCondition_STUMPsAppearOnRetry(t *testing.T) {
 	datahub := newDatahubServer([]string{subtreeHash})
 	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL, nil)
+	b := newTestBuilder(ms, datahub.URL)
 
 	// First call: no STUMPs yet — should error
 	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
@@ -515,7 +510,7 @@ func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
 	datahub := newDatahubServer([]string{subtreeHash1, subtreeHash2})
 	defer datahub.Close()
 
-	b := newTestBuilder(ms, datahub.URL, nil)
+	b := newTestBuilder(ms, datahub.URL)
 
 	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
 		t.Fatalf("handleMessage failed: %v", err)
@@ -649,10 +644,7 @@ func TestBuilder_E2E_BUMPExtractionWithRealisticSTUMP(t *testing.T) {
 	datahub := newDatahubServer([]string{subtreeHash})
 	defer datahub.Close()
 
-	tracker := store.NewTxTracker()
-	tracker.AddHash(*h1, models.StatusSeenOnNetwork)
-
-	b := newTestBuilder(ms, datahub.URL, tracker)
+	b := newTestBuilder(ms, datahub.URL)
 
 	if err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash)); err != nil {
 		t.Fatalf("handleMessage failed: %v", err)

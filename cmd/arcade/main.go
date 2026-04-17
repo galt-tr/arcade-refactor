@@ -68,14 +68,6 @@ func run(cmd *cobra.Command, _ []string) error {
 	// Create shared components
 	txTracker := store.NewTxTracker()
 
-	// Load tracked transactions from Aerospike so split microservices
-	// (especially bump-builder) know which txids to match against.
-	if loaded, err := txTracker.LoadFromStore(context.Background(), aeroStore, 0); err != nil {
-		logger.Warn("failed to load tx tracker from store", zap.Error(err))
-	} else if loaded > 0 {
-		logger.Info("loaded tracked transactions from store", zap.Int("count", loaded))
-	}
-
 	teranodeClient := teranode.NewClient(cfg.DatahubURLs, cfg.Teranode.AuthToken)
 
 	var merkleClient *merkleservice.Client
@@ -153,7 +145,7 @@ func buildServices(
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, logger, producer, aeroStore, txTracker))
+			svcs = append(svcs, api_server.New(cfg, logger, producer, aeroStore, txTracker))
 	}
 	if shouldRun("p2p-client") {
 		svcs = append(svcs, p2p_client.New(cfg, logger, producer))
@@ -162,7 +154,7 @@ func buildServices(
 		svcs = append(svcs, block_processor.New(cfg, logger, aeroStore))
 	}
 	if shouldRun("bump-builder") {
-		svcs = append(svcs, bump_builder.New(cfg, logger, aeroStore, txTracker))
+		svcs = append(svcs, bump_builder.New(cfg, logger, aeroStore))
 	}
 	if shouldRun("tx-validator") {
 		svcs = append(svcs, tx_validator.New(cfg, logger, producer, aeroStore, txTracker, txVal))

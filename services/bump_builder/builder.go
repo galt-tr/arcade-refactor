@@ -19,18 +19,16 @@ type Builder struct {
 	cfg           *config.Config
 	logger        *zap.Logger
 	store         store.Store
-	txTracker     *store.TxTracker
 	consumer      *kafka.ConsumerGroup
 	producer      *kafka.Producer
 	stumpConsumer *StumpConsumer
 }
 
-func New(cfg *config.Config, logger *zap.Logger, st store.Store, tracker *store.TxTracker) *Builder {
+func New(cfg *config.Config, logger *zap.Logger, st store.Store) *Builder {
 	return &Builder{
-		cfg:       cfg,
-		logger:    logger.Named("bump-builder"),
-		store:     st,
-		txTracker: tracker,
+		cfg:    cfg,
+		logger: logger.Named("bump-builder"),
+		store:  st,
 	}
 }
 
@@ -139,7 +137,7 @@ func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage
 	}
 
 	// 3. Build compound BUMP
-	compound, txids, err := bump.BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP, b.txTracker)
+	compound, txids, err := bump.BuildCompoundBUMP(stumps, subtreeHashes, coinbaseBUMP)
 	if err != nil {
 		return fmt.Errorf("building compound BUMP: %w", err)
 	}

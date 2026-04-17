@@ -305,6 +305,9 @@ func (s *AerospikeStore) SetMinedByTxIDs(_ context.Context, blockHash string, tx
 	now := time.Now()
 	var statuses []*models.TransactionStatus
 
+	bwp := aero.NewBatchWritePolicy()
+	bwp.RecordExistsAction = aero.UPDATE_ONLY
+
 	for i := 0; i < len(txids); i += s.batchSize {
 		end := i + s.batchSize
 		if end > len(txids) {
@@ -323,18 +326,20 @@ func (s *AerospikeStore) SetMinedByTxIDs(_ context.Context, blockHash string, tx
 				aero.PutOp(aero.NewBin("block_hash", blockHash)),
 				aero.PutOp(aero.NewBin("timestamp", now.UnixMilli())),
 			}
-			records[j] = aero.NewBatchWrite(aero.NewBatchWritePolicy(), key, ops...)
+			records[j] = aero.NewBatchWrite(bwp, key, ops...)
 		}
 
 		s.client.BatchOperate(nil, records)
 
-		for _, txid := range batch {
-			statuses = append(statuses, &models.TransactionStatus{
-				TxID:      txid,
-				Status:    models.StatusMined,
-				BlockHash: blockHash,
-				Timestamp: now,
-			})
+		for j, txid := range batch {
+			if records[j] != nil && records[j].BatchRec().Err == nil {
+				statuses = append(statuses, &models.TransactionStatus{
+					TxID:      txid,
+					Status:    models.StatusMined,
+					BlockHash: blockHash,
+					Timestamp: now,
+				})
+			}
 		}
 	}
 
