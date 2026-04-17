@@ -83,6 +83,12 @@ func run(cmd *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Start health server for non-API modes (api-server serves /health on its own port)
+	if cfg.Mode != "api-server" {
+		hs := services.NewHealthServer(cfg.Health.Port, logger)
+		hs.Start(ctx)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
