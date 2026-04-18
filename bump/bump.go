@@ -302,6 +302,37 @@ func ExtractLevel0Hashes(stumpData []byte) []chainhash.Hash {
 	return hashes
 }
 
+// ValidateCompoundRoot computes the merkle root from the compound BUMP using
+// any level-0 leaf and compares it against the expected block-header merkle
+// root. Returns a descriptive error on mismatch so the caller can log both
+// values and refuse to persist a broken compound.
+func ValidateCompoundRoot(compound *transaction.MerklePath, expected *chainhash.Hash) error {
+	if expected == nil {
+		return fmt.Errorf("no block-header merkle root to validate against")
+	}
+	if compound == nil || len(compound.Path) == 0 || len(compound.Path[0]) == 0 {
+		return fmt.Errorf("empty compound path")
+	}
+	var leaf *chainhash.Hash
+	for _, l := range compound.Path[0] {
+		if l.Hash != nil {
+			leaf = l.Hash
+			break
+		}
+	}
+	if leaf == nil {
+		return fmt.Errorf("no level-0 hash to compute root from")
+	}
+	got, err := compound.ComputeRoot(leaf)
+	if err != nil {
+		return fmt.Errorf("compute root from compound: %w", err)
+	}
+	if !got.IsEqual(expected) {
+		return fmt.Errorf("computed root %s != block header merkle root %s", got, expected)
+	}
+	return nil
+}
+
 // BuildCompoundBUMP merges multiple per-subtree BUMPs into a single compound MerklePath
 // containing all tracked transactions at level 0. The tracker is used to discover
 // which level-0 hashes are tracked transactions.

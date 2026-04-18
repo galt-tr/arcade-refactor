@@ -138,16 +138,33 @@ func makeBlockProcessedMsg(blockHash string) *sarama.ConsumerMessage {
 	}
 }
 
+// buildBlockHeader returns an 80-byte block header with the given merkle root
+// embedded at bytes 36:68 (standard BSV header layout). Other fields are zero.
+func buildBlockHeader(merkleRoot []byte) []byte {
+	header := make([]byte, 80)
+	if len(merkleRoot) == 32 {
+		copy(header[36:68], merkleRoot)
+	}
+	return header
+}
+
 // newDatahubServer creates a test HTTP server that serves binary block data for BUMP construction.
 // Binary format: header (80) | txCount (varint) | sizeBytes (varint) |
 // subtreeCount (varint) | subtreeHashes (N×32) | coinbaseTx (variable) |
 // blockHeight (varint) | coinbaseBUMPLen (varint)
-func newDatahubServer(subtreeHexHashes []string) *httptest.Server {
+//
+// merkleRoot is written into the header at bytes 36:68 so the builder's
+// validation step can compare the compound BUMP's computed root against it.
+// Pass zeroMerkleRoot() when the test does not reach validation.
+//
+// Subtree hashes are written in internal byte order (CloneBytes), matching
+// what parseBlockBinary expects (it uses chainhash.NewHash on raw bytes, which
+// does not reverse — unlike chainhash.NewHashFromHex).
+func newDatahubServer(merkleRoot []byte, subtreeHashes []chainhash.Hash) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var buf bytes.Buffer
 
-		// Block header (80 zero bytes)
-		buf.Write(make([]byte, 80))
+		buf.Write(buildBlockHeader(merkleRoot))
 
 		// Transaction count (varint: 1)
 		buf.WriteByte(0x01)
@@ -156,14 +173,11 @@ func newDatahubServer(subtreeHexHashes []string) *httptest.Server {
 		buf.WriteByte(0x00)
 
 		// Subtree count (varint)
-		buf.Write(transaction.VarInt(len(subtreeHexHashes)).Bytes())
+		buf.Write(transaction.VarInt(len(subtreeHashes)).Bytes())
 
-		// Subtree hashes (32 bytes each)
-		for _, hexHash := range subtreeHexHashes {
-			hashBytes, _ := hex.DecodeString(hexHash)
-			padded := make([]byte, 32)
-			copy(padded, hashBytes)
-			buf.Write(padded)
+		// Subtree hashes (32 bytes each, internal byte order)
+		for i := range subtreeHashes {
+			buf.Write(subtreeHashes[i].CloneBytes())
 		}
 
 		// Minimal coinbase transaction
@@ -182,20 +196,17 @@ func newDatahubServer(subtreeHexHashes []string) *httptest.Server {
 }
 
 // newDatahubServerWithCoinbaseBUMP creates a test server that includes coinbase BUMP data.
-func newDatahubServerWithCoinbaseBUMP(subtreeHexHashes []string, coinbaseBUMP []byte) *httptest.Server {
+func newDatahubServerWithCoinbaseBUMP(merkleRoot []byte, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var buf bytes.Buffer
 
-		buf.Write(make([]byte, 80))       // header
-		buf.WriteByte(0x01)               // txCount
-		buf.WriteByte(0x00)               // sizeBytes
-		buf.Write(transaction.VarInt(len(subtreeHexHashes)).Bytes()) // subtreeCount
+		buf.Write(buildBlockHeader(merkleRoot))                   // header
+		buf.WriteByte(0x01)                                       // txCount
+		buf.WriteByte(0x00)                                       // sizeBytes
+		buf.Write(transaction.VarInt(len(subtreeHashes)).Bytes()) // subtreeCount
 
-		for _, hexHash := range subtreeHexHashes {
-			hashBytes, _ := hex.DecodeString(hexHash)
-			padded := make([]byte, 32)
-			copy(padded, hashBytes)
-			buf.Write(padded)
+		for i := range subtreeHashes {
+			buf.Write(subtreeHashes[i].CloneBytes())
 		}
 
 		coinbaseTx := transaction.NewTransaction()
@@ -210,6 +221,22 @@ func newDatahubServerWithCoinbaseBUMP(subtreeHexHashes []string, coinbaseBUMP []
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(buf.Bytes())
 	}))
+}
+
+// mustHash converts a hex string into a chainhash.Hash or fatal-fails the test.
+// Uses raw byte interpretation (not NewHashFromHex's reversed form) since the
+// test hexes represent internal byte order for fake/synthetic hashes.
+func mustHash(t *testing.T, hexStr string) chainhash.Hash {
+	t.Helper()
+	b, err := hex.DecodeString(hexStr)
+	if err != nil {
+		t.Fatalf("bad hex: %v", err)
+	}
+	var h chainhash.Hash
+	if err := h.SetBytes(b); err != nil {
+		t.Fatalf("SetBytes: %v", err)
+	}
+	return h
 }
 
 func newFailingDatahubServer() *httptest.Server {
@@ -232,28 +259,109 @@ func newTestBuilder(st store.Store, datahubURL string) *Builder {
 // makeMinimalSTUMP creates a minimal valid BRC-74 STUMP binary with a single level-0 leaf.
 // This is the simplest valid merkle path: one transaction, one level, block height 1.
 func makeMinimalSTUMP(txidHex string) []byte {
-	// BRC-74 binary format:
-	// - blockHeight: varint (1 byte for small values)
-	// - treeHeight: varint (1 = single level)
-	// - nLeaves: varint (1 leaf)
-	// - leaf: offset (varint 0) + flags (0x01 = txid) + 32-byte hash
+	// BRC-74 flag bits: bit 0 = duplicate (no hash follows), bit 1 = txid.
+	// We want to encode the tracked txid itself, so flags = 0x02.
 	txidBytes, _ := hex.DecodeString(txidHex)
 	if len(txidBytes) != 32 {
-		// Pad to 32 bytes
 		padded := make([]byte, 32)
 		copy(padded, txidBytes)
 		txidBytes = padded
 	}
 
 	buf := []byte{
-		0x01,       // blockHeight = 1
-		0x01,       // treeHeight = 1 (one level)
-		0x01,       // nLeaves at level 0 = 1
-		0x00,       // offset = 0
-		0x01,       // flags: bit 0 set = this is a txid (client txid flag)
+		0x01, // blockHeight = 1
+		0x01, // treeHeight = 1 (one level)
+		0x01, // nLeaves at level 0 = 1
+		0x00, // offset = 0
+		0x02, // flags: bit 1 = txid (hash follows)
 	}
 	buf = append(buf, txidBytes...)
 	return buf
+}
+
+// expectedCompoundRoot runs the same assembly the builder will run and returns
+// the merkle root the compound will produce. Test setups use this so the
+// datahub-served header merkle root matches the compound that will actually
+// be built, letting the validation step succeed on happy paths.
+func expectedCompoundRoot(t *testing.T, stumps []*models.Stump, subtreeHashes []chainhash.Hash, coinbaseBUMP []byte) []byte {
+	t.Helper()
+	// Pass copies so we don't mutate the caller's slices (BuildCompoundBUMP
+	// rewrites subtreeHashes[0] when a coinbase BUMP is present).
+	stumpsCopy := make([]*models.Stump, len(stumps))
+	for i, s := range stumps {
+		sc := *s
+		stumpsCopy[i] = &sc
+	}
+	hashesCopy := make([]chainhash.Hash, len(subtreeHashes))
+	copy(hashesCopy, subtreeHashes)
+
+	compound, _, err := bump.BuildCompoundBUMP(stumpsCopy, hashesCopy, coinbaseBUMP)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+	var leaf *chainhash.Hash
+	for _, l := range compound.Path[0] {
+		if l.Hash != nil {
+			leaf = l.Hash
+			break
+		}
+	}
+	if leaf == nil {
+		t.Fatalf("compound has no level-0 hash")
+	}
+	root, err := compound.ComputeRoot(leaf)
+	if err != nil {
+		t.Fatalf("ComputeRoot failed: %v", err)
+	}
+	return root.CloneBytes()
+}
+
+// zeroMerkleRoot returns 32 zero bytes for tests that never reach validation
+// (getStumps error, empty blocks, datahub failure, bad JSON).
+func zeroMerkleRoot() []byte { return make([]byte, 32) }
+
+// makeTwoLeafSTUMP builds a BRC-74 STUMP for a 2-tx subtree with the tracked
+// txid at offset 0 and a sibling hash at offset 1. Used in multi-subtree tests
+// so each subtree's internalHeight (=1) matches a real subtreeSize (=2).
+func makeTwoLeafSTUMP(txidHex, siblingHex string) []byte {
+	txidBytes, _ := hex.DecodeString(txidHex)
+	sibBytes, _ := hex.DecodeString(siblingHex)
+	if len(txidBytes) != 32 {
+		p := make([]byte, 32)
+		copy(p, txidBytes)
+		txidBytes = p
+	}
+	if len(sibBytes) != 32 {
+		p := make([]byte, 32)
+		copy(p, sibBytes)
+		sibBytes = p
+	}
+
+	buf := []byte{
+		0x01, // blockHeight = 1
+		0x01, // treeHeight = 1
+		0x02, // nLeaves at level 0 = 2
+		0x00, // offset 0
+		0x02, // flags: txid
+	}
+	buf = append(buf, txidBytes...)
+	buf = append(buf,
+		0x01, // offset 1
+		0x00, // flags: data
+	)
+	buf = append(buf, sibBytes...)
+	return buf
+}
+
+// subtreeRootFromTwoLeafSTUMP returns the merkle root of the 2-leaf subtree
+// encoded by makeTwoLeafSTUMP (i.e. MerkleTreeParent(txid, sibling)). Uses raw
+// byte interpretation of the hex so it matches the bytes written by
+// makeTwoLeafSTUMP and read back by the STUMP parser.
+func subtreeRootFromTwoLeafSTUMP(t *testing.T, txidHex, siblingHex string) chainhash.Hash {
+	t.Helper()
+	txid := mustHash(t, txidHex)
+	sib := mustHash(t, siblingHex)
+	return *transaction.MerkleTreeParent(&txid, &sib)
 }
 
 // --- Tests ---
@@ -262,7 +370,7 @@ func TestBuilder_HandleMessage_NoSTUMPs_ReturnsNil(t *testing.T) {
 	// A block with no STUMPs means no tracked transactions in it — this is
 	// legitimate (STUMPs are sparse) and must not return an error or trigger DLQ.
 	ms := newMockStore()
-	datahub := newDatahubServer([]string{})
+	datahub := newDatahubServer(zeroMerkleRoot(), nil)
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -279,7 +387,7 @@ func TestBuilder_HandleMessage_GetStumpsError_Propagated(t *testing.T) {
 	ms := newMockStore()
 	ms.getStumpsErr = errors.New("INDEX_NOTFOUND")
 
-	datahub := newDatahubServer(nil)
+	datahub := newDatahubServer(zeroMerkleRoot(), nil)
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -323,9 +431,13 @@ func TestBuilder_HandleMessage_InsertBUMPError_ReturnsError(t *testing.T) {
 	ms.addStump(blockHash, 0, stumpData)
 	ms.insertBUMPErr = errors.New("SERVER_MEM_ERROR")
 
-	// Datahub returns one subtree hash (single-subtree block: STUMP = BUMP)
-	subtreeHash := "2222222222222222222222222222222222222222222222222222222222222222"
-	datahub := newDatahubServer([]string{subtreeHash})
+	// Single-subtree with a single-leaf STUMP: compound root == the txid itself.
+	// The subtreeHash slot is unused by assembleFullPath in the 1-subtree case.
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -347,9 +459,11 @@ func TestBuilder_HandleMessage_HappyPath_SingleSubtree(t *testing.T) {
 	stumpData := makeMinimalSTUMP(txidHex)
 	ms.addStump(blockHash, 0, stumpData)
 
-	// Single subtree: its hash doesn't matter much for the builder flow
-	subtreeHash := "2222222222222222222222222222222222222222222222222222222222222222"
-	datahub := newDatahubServer([]string{subtreeHash})
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -380,8 +494,11 @@ func TestBuilder_HandleMessage_HappyPath_WithTracker(t *testing.T) {
 	stumpData := makeMinimalSTUMP(txidHex)
 	ms.addStump(blockHash, 0, stumpData)
 
-	subtreeHash := "2222222222222222222222222222222222222222222222222222222222222222"
-	datahub := newDatahubServer([]string{subtreeHash})
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{subtreeHash}, nil)
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -404,7 +521,7 @@ func TestBuilder_HandleMessage_HappyPath_WithTracker(t *testing.T) {
 
 func TestBuilder_HandleMessage_EmptyBlockHash_ReturnsError(t *testing.T) {
 	ms := newMockStore()
-	datahub := newDatahubServer(nil)
+	datahub := newDatahubServer(zeroMerkleRoot(), nil)
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -417,7 +534,7 @@ func TestBuilder_HandleMessage_EmptyBlockHash_ReturnsError(t *testing.T) {
 
 func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
 	ms := newMockStore()
-	datahub := newDatahubServer(nil)
+	datahub := newDatahubServer(zeroMerkleRoot(), nil)
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -440,8 +557,15 @@ func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
 	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
 
-	subtreeHash := "2222222222222222222222222222222222222222222222222222222222222222"
-	datahub := newDatahubServer([]string{subtreeHash})
+	// Compute what the late-arriving STUMP will produce so the datahub header
+	// merkle root set up ahead of time matches the compound the builder builds
+	// after the grace window.
+	lateStump := makeMinimalSTUMP(txidHex)
+	subtreeHash := mustHash(t, txidHex)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: lateStump}},
+		[]chainhash.Hash{subtreeHash}, nil)
+	datahub := newDatahubServer(root, []chainhash.Hash{subtreeHash})
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -453,7 +577,7 @@ func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 		_ = ms.InsertStump(context.Background(), &models.Stump{
 			BlockHash:    blockHash,
 			SubtreeIndex: 0,
-			StumpData:    makeMinimalSTUMP(txidHex),
+			StumpData:    lateStump,
 		})
 	}()
 
@@ -470,18 +594,26 @@ func TestBuilder_LateSTUMP_ArrivesDuringGraceWindow(t *testing.T) {
 
 // TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP verifies the full STUMP→BUMP workflow:
 // store STUMPs via InsertStump → query via GetStumpsByBlockHash → build BUMP.
+// Uses 2-leaf STUMPs so each subtree has internalHeight=1 matching subtreeSize=2,
+// which is the geometric invariant BuildCompoundBUMP's shift math assumes.
 func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
 	ms := newMockStore()
 	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
 	txid1 := "1111111111111111111111111111111111111111111111111111111111111111"
 	txid2 := "3333333333333333333333333333333333333333333333333333333333333333"
+	sib1 := "5555555555555555555555555555555555555555555555555555555555555555"
+	sib2 := "7777777777777777777777777777777777777777777777777777777777777777"
 
 	// Store STUMPs via the store interface (mimicking stump consumer)
-	for i, txid := range []string{txid1, txid2} {
+	stumpData := [][]byte{
+		makeTwoLeafSTUMP(txid1, sib1),
+		makeTwoLeafSTUMP(txid2, sib2),
+	}
+	for i, data := range stumpData {
 		stump := &models.Stump{
 			BlockHash:    blockHash,
 			SubtreeIndex: i,
-			StumpData:    makeMinimalSTUMP(txid),
+			StumpData:    data,
 		}
 		if err := ms.InsertStump(context.Background(), stump); err != nil {
 			t.Fatalf("InsertStump %d failed: %v", i, err)
@@ -497,10 +629,14 @@ func TestBuilder_E2E_InsertStump_GetStumps_BuildBUMP(t *testing.T) {
 		t.Fatalf("expected 2 STUMPs, got %d", len(stumps))
 	}
 
-	// Build BUMP via handleMessage
-	subtreeHash1 := "2222222222222222222222222222222222222222222222222222222222222222"
-	subtreeHash2 := "4444444444444444444444444444444444444444444444444444444444444444"
-	datahub := newDatahubServer([]string{subtreeHash1, subtreeHash2})
+	// subtreeHashes[i] must match the root that each STUMP's leaves produce,
+	// otherwise the merged compound will not verify against any header root.
+	subtreeHashes := []chainhash.Hash{
+		subtreeRootFromTwoLeafSTUMP(t, txid1, sib1),
+		subtreeRootFromTwoLeafSTUMP(t, txid2, sib2),
+	}
+	root := expectedCompoundRoot(t, stumps, subtreeHashes, nil)
+	datahub := newDatahubServer(root, subtreeHashes)
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -551,8 +687,12 @@ func TestBuilder_E2E_BUMPExtractionWithRealisticSTUMP(t *testing.T) {
 	stumpData := stumpMP.Bytes()
 	ms.addStump(blockHash, 0, stumpData)
 
-	subtreeHash := "3333333333333333333333333333333333333333333333333333333333333333"
-	datahub := newDatahubServer([]string{subtreeHash})
+	// Single-subtree, two-leaf STUMP: compound root == MerkleTreeParent(h1, h2).
+	subtreeHash := transaction.MerkleTreeParent(h1, h2)
+	root := expectedCompoundRoot(t,
+		[]*models.Stump{{BlockHash: blockHash, SubtreeIndex: 0, StumpData: stumpData}},
+		[]chainhash.Hash{*subtreeHash}, nil)
+	datahub := newDatahubServer(root, []chainhash.Hash{*subtreeHash})
 	defer datahub.Close()
 
 	b := newTestBuilder(ms, datahub.URL)
@@ -575,6 +715,52 @@ func TestBuilder_E2E_BUMPExtractionWithRealisticSTUMP(t *testing.T) {
 	}
 	if len(result) == 0 {
 		t.Fatal("ExtractMinimalPathForTx returned empty bytes")
+	}
+}
+
+// TestBuilder_HandleMessage_RootMismatch_SkipsPersistence asserts that a
+// compound BUMP whose computed root differs from the block-header merkle root
+// causes handleMessage to short-circuit: the BUMP is not stored, txs are not
+// marked mined, and STUMPs are not pruned — so the next retry (or a follow-up
+// fix) can rebuild from the same inputs.
+func TestBuilder_HandleMessage_RootMismatch_SkipsPersistence(t *testing.T) {
+	ms := newMockStore()
+	blockHash := "aabbccdd00000000000000000000000000000000000000000000000000000000"
+	txidHex := "1111111111111111111111111111111111111111111111111111111111111111"
+
+	stumpData := makeMinimalSTUMP(txidHex)
+	ms.addStump(blockHash, 0, stumpData)
+
+	// Serve a header merkle root that deliberately does NOT match what the
+	// compound will produce (all 0xaa bytes vs the real txid-derived root).
+	wrongRoot := make([]byte, 32)
+	for i := range wrongRoot {
+		wrongRoot[i] = 0xaa
+	}
+	subtreeHash := mustHash(t, txidHex)
+	datahub := newDatahubServer(wrongRoot, []chainhash.Hash{subtreeHash})
+	defer datahub.Close()
+
+	b := newTestBuilder(ms, datahub.URL)
+
+	err := b.handleMessage(context.Background(), makeBlockProcessedMsg(blockHash))
+	if err == nil {
+		t.Fatal("expected error on compound root mismatch, got nil")
+	}
+	if !containsStr(err.Error(), "compound BUMP root mismatch") {
+		t.Errorf("expected 'compound BUMP root mismatch' in error, got: %v", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, ok := ms.bumps[blockHash]; ok {
+		t.Error("expected no BUMP to be stored on validation failure")
+	}
+	if len(ms.minedCalls) != 0 {
+		t.Errorf("expected SetMinedByTxIDs not to be called on validation failure, got %d calls", len(ms.minedCalls))
+	}
+	if len(ms.deletedBlocks) != 0 {
+		t.Errorf("expected STUMPs not to be pruned on validation failure, got deletes: %v", ms.deletedBlocks)
 	}
 }
 

@@ -123,13 +123,17 @@ func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage
 	logger.Info("building compound BUMP", zap.Int("stump_count", len(stumps)))
 	logStumpInputs(logger, stumps)
 
-	// 2. Fetch subtree hashes + coinbase BUMP from datahub
+	// 2. Fetch subtree hashes + coinbase BUMP + header merkle root from datahub
 	logger.Debug("fetching block data from datahub", zap.Strings("datahub_urls", b.cfg.DatahubURLs))
-	subtreeHashes, coinbaseBUMP, err := bump.FetchBlockDataForBUMP(ctx, b.cfg.DatahubURLs, blockHash)
+	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMP(ctx, b.cfg.DatahubURLs, blockHash)
 	if err != nil {
 		return fmt.Errorf("fetching block data: %w", err)
 	}
-	logger.Debug("datahub fetch succeeded", zap.Int("subtree_count", len(subtreeHashes)), zap.Bool("has_coinbase_bump", coinbaseBUMP != nil))
+	logger.Debug("datahub fetch succeeded",
+		zap.Int("subtree_count", len(subtreeHashes)),
+		zap.Bool("has_coinbase_bump", coinbaseBUMP != nil),
+		zap.Bool("has_header_merkle_root", headerMerkleRoot != nil),
+	)
 	logBlockInputs(logger, subtreeHashes, coinbaseBUMP)
 
 	if len(subtreeHashes) == 0 {
@@ -151,12 +155,22 @@ func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage
 	bumpBytes := compound.Bytes()
 	logCompoundBUMP(logger, compound, bumpBytes, txids)
 
-	// 4. Store compound BUMP as binary
+	// 4. Validate: compound BUMP root must match the block header's merkle root.
+	// A mismatch means the compound is malformed (missing siblings, wrong offsets,
+	// stale subtree roots, …). Refuse to persist so clients never see a BUMP that
+	// fails ComputeRoot, and leave txs non-MINED + STUMPs intact so a retry can
+	// rebuild once the inputs are correct.
+	if err := bump.ValidateCompoundRoot(compound, headerMerkleRoot); err != nil {
+		dumpBUMPFailureInputs(logger, stumps, subtreeHashes, coinbaseBUMP, headerMerkleRoot, compound, bumpBytes, txids, err)
+		return fmt.Errorf("compound BUMP root mismatch for block %s: %w", blockHash, err)
+	}
+
+	// 5. Store compound BUMP as binary
 	if err := b.store.InsertBUMP(ctx, blockHash, blockHeight, bumpBytes); err != nil {
 		return fmt.Errorf("storing BUMP: %w", err)
 	}
 
-	// 5. Set tracked transactions to MINED
+	// 6. Set tracked transactions to MINED
 	if len(txids) > 0 {
 		if _, err := b.store.SetMinedByTxIDs(ctx, blockHash, txids); err != nil {
 			logger.Error("failed to set mined status", zap.Error(err))
@@ -164,11 +178,10 @@ func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage
 			logger.Info("set transactions to MINED",
 				zap.Int("count", len(txids)),
 			)
-			logPerTxPaths(logger, bumpBytes, txids)
 		}
 	}
 
-	// 6. Prune STUMPs
+	// 7. Prune STUMPs
 	if err := b.store.DeleteStumpsByBlockHash(ctx, blockHash); err != nil {
 		logger.Warn("failed to clean up STUMPs", zap.Error(err))
 	}
@@ -296,21 +309,59 @@ func logCompoundBUMP(logger *zap.Logger, compound *transaction.MerklePath, bumpB
 	}
 }
 
-// logPerTxPaths logs the minimal path each tracked client will receive for its
-// txid. Useful for verifying end-to-end that the stored BUMP yields the same
-// extracted path the client would independently compute.
-func logPerTxPaths(logger *zap.Logger, bumpBytes []byte, txids []string) {
-	if !logger.Core().Enabled(zap.DebugLevel) {
-		return
+// dumpBUMPFailureInputs emits an ERROR-level event with every input needed to
+// replay a failed compound BUMP build offline: raw STUMP bytes (hex) per subtree,
+// subtree hashes, coinbase BUMP, block-header merkle root, the final compound
+// BUMP bytes, and per-level offsets of the compound. Always emits regardless of
+// configured log level — this fires only when validation fails, so it doesn't
+// contribute to normal-path noise.
+func dumpBUMPFailureInputs(
+	logger *zap.Logger,
+	stumps []*models.Stump,
+	subtreeHashes []chainhash.Hash,
+	coinbaseBUMP []byte,
+	headerMerkleRoot *chainhash.Hash,
+	compound *transaction.MerklePath,
+	compoundBytes []byte,
+	txids []string,
+	validationErr error,
+) {
+	stumpDumps := make([]string, len(stumps))
+	for i, s := range stumps {
+		stumpDumps[i] = fmt.Sprintf("subtree=%d bytes=%d hex=%s",
+			s.SubtreeIndex, len(s.StumpData), hex.EncodeToString(s.StumpData))
 	}
-	for _, txid := range txids {
-		path := bump.ExtractMinimalPathForTx(bumpBytes, txid)
-		logger.Debug("per-tx minimal path",
-			zap.String("txid", txid),
-			zap.Int("bytes", len(path)),
-			zap.String("hex", hex.EncodeToString(path)),
-		)
+	subtreeHex := make([]string, len(subtreeHashes))
+	for i, h := range subtreeHashes {
+		subtreeHex[i] = h.String()
 	}
+	levelDumps := make([]string, 0, len(compound.Path))
+	for level, elems := range compound.Path {
+		levelDumps = append(levelDumps,
+			fmt.Sprintf("level=%d count=%d elems=[%s]", level, len(elems), formatPathElements(elems)))
+	}
+
+	var headerRootHex string
+	if headerMerkleRoot != nil {
+		headerRootHex = headerMerkleRoot.String()
+	}
+
+	logger.Error("compound BUMP validation failed — refusing to persist",
+		zap.Error(validationErr),
+		zap.String("header_merkle_root", headerRootHex),
+		zap.Int("stump_count", len(stumps)),
+		zap.Strings("stumps", stumpDumps),
+		zap.Int("subtree_count", len(subtreeHashes)),
+		zap.Strings("subtree_hashes", subtreeHex),
+		zap.Int("coinbase_bump_bytes", len(coinbaseBUMP)),
+		zap.String("coinbase_bump_hex", hex.EncodeToString(coinbaseBUMP)),
+		zap.Int("compound_bytes", len(compoundBytes)),
+		zap.String("compound_hex", hex.EncodeToString(compoundBytes)),
+		zap.Int("compound_levels", len(compound.Path)),
+		zap.Strings("compound_by_level", levelDumps),
+		zap.Int("txid_count", len(txids)),
+		zap.Strings("txids", txids),
+	)
 }
 
 // formatPathElements renders a slice of PathElements as a human-readable string

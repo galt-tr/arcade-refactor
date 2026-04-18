@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -1096,6 +1097,89 @@ func TestExtractMinimalPathForTx_TxNotFound(t *testing.T) {
 	result := ExtractMinimalPathForTx(bumpData, fakeTxid)
 	if result != nil {
 		t.Fatalf("expected nil for unknown txid, got %d bytes", len(result))
+	}
+}
+
+func TestValidateCompoundRoot_Passes(t *testing.T) {
+	// 4-subtree, 4-tx-per-subtree block: build the real compound via
+	// BuildCompoundBUMP, then validate against the independently-computed
+	// block root from test helpers. Both must agree.
+	allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(4, 4)
+
+	stumps := make([]*models.Stump, 4)
+	for s := 0; s < 4; s++ {
+		stumps[s] = &models.Stump{
+			BlockHash:    "deadbeef",
+			SubtreeIndex: s,
+			StumpData:    buildFullSTUMP(allLeaves[s], 0, 700000),
+		}
+	}
+
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+	if err := ValidateCompoundRoot(compound, &blockRoot); err != nil {
+		t.Fatalf("ValidateCompoundRoot returned error for valid compound: %v", err)
+	}
+}
+
+func TestValidateCompoundRoot_RejectsMismatch(t *testing.T) {
+	allLeaves, subtreeHashes, _ := multiSubtreeTestSetup(2, 4)
+
+	stumps := make([]*models.Stump, 2)
+	for s := 0; s < 2; s++ {
+		stumps[s] = &models.Stump{
+			BlockHash:    "deadbeef",
+			SubtreeIndex: s,
+			StumpData:    buildFullSTUMP(allLeaves[s], 0, 700000),
+		}
+	}
+
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+
+	wrong := chainhash.Hash{}
+	for i := range wrong {
+		wrong[i] = 0xcc
+	}
+	err = ValidateCompoundRoot(compound, &wrong)
+	if err == nil {
+		t.Fatal("expected error for mismatched root, got nil")
+	}
+	// Error should reference both the computed and expected roots so logs can
+	// surface the diff without extra formatting.
+	if !strings.Contains(err.Error(), wrong.String()) {
+		t.Errorf("expected expected-root in error, got: %v", err)
+	}
+}
+
+func TestValidateCompoundRoot_RejectsEmptyInputs(t *testing.T) {
+	// nil expected
+	realHash := chainhash.Hash{}
+	empty := &transaction.MerklePath{Path: [][]*transaction.PathElement{{{Hash: &realHash}}}}
+	if err := ValidateCompoundRoot(empty, nil); err == nil {
+		t.Error("expected error for nil expected, got nil")
+	}
+
+	// nil compound
+	if err := ValidateCompoundRoot(nil, &realHash); err == nil {
+		t.Error("expected error for nil compound, got nil")
+	}
+
+	// compound with empty path
+	emptyPath := &transaction.MerklePath{}
+	if err := ValidateCompoundRoot(emptyPath, &realHash); err == nil {
+		t.Error("expected error for empty path, got nil")
+	}
+
+	// compound whose level-0 entries have no hashes at all
+	dupTrue := true
+	noHash := &transaction.MerklePath{Path: [][]*transaction.PathElement{{{Offset: 0, Duplicate: &dupTrue}}}}
+	if err := ValidateCompoundRoot(noHash, &realHash); err == nil {
+		t.Error("expected error when level-0 has no hash, got nil")
 	}
 }
 
