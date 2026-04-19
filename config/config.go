@@ -65,7 +65,12 @@ type PropagationConfig struct {
 	MerkleConcurrency int `mapstructure:"merkle_concurrency"`
 	RetryMaxAttempts  int `mapstructure:"retry_max_attempts"`
 	RetryBackoffMs    int `mapstructure:"retry_backoff_ms"`
-	RetryBufferSize   int `mapstructure:"retry_buffer_size"`
+	ReaperIntervalMs  int `mapstructure:"reaper_interval_ms"`
+	ReaperBatchSize   int `mapstructure:"reaper_batch_size"`
+	// LeaseTTLMs bounds how long the reaper lease remains valid without a
+	// renewal. Set to at least 2–3× reaper_interval_ms so a missed tick
+	// doesn't trigger a false-positive failover. Defaults to 3× interval.
+	LeaseTTLMs int `mapstructure:"lease_ttl_ms"`
 }
 
 // BumpBuilderConfig controls the BUMP construction workflow. GraceWindowMs is the
@@ -135,7 +140,11 @@ func setDefaults() {
 	viper.SetDefault("propagation.merkle_concurrency", 10)
 	viper.SetDefault("propagation.retry_max_attempts", 5)
 	viper.SetDefault("propagation.retry_backoff_ms", 500)
-	viper.SetDefault("propagation.retry_buffer_size", 10000)
+	viper.SetDefault("propagation.reaper_interval_ms", 30000)
+	viper.SetDefault("propagation.reaper_batch_size", 500)
+	// 0 keeps New()'s 3×reaper_interval default, so changing reaper_interval
+	// automatically moves the lease TTL unless the operator opts into a fixed value.
+	viper.SetDefault("propagation.lease_ttl_ms", 0)
 	viper.SetDefault("bump_builder.grace_window_ms", 30000)
 }
 

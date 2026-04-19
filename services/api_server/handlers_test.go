@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
 
@@ -95,9 +96,15 @@ func (m *mockStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stu
 	return nil, nil
 }
 func (m *mockStore) DeleteStumpsByBlockHash(context.Context, string) error { return nil }
-func (m *mockStore) IncrementRetryCount(context.Context, string) (int, error) { return 0, nil }
-func (m *mockStore) GetPendingRetryTxs(context.Context) ([]*models.TransactionStatus, error) {
+func (m *mockStore) BumpRetryCount(context.Context, string) (int, error) { return 0, nil }
+func (m *mockStore) SetPendingRetryFields(context.Context, string, []byte, time.Time) error {
+	return nil
+}
+func (m *mockStore) GetReadyRetries(context.Context, time.Time, int) ([]*store.PendingRetry, error) {
 	return nil, nil
+}
+func (m *mockStore) ClearRetryState(context.Context, string, models.Status, string) error {
+	return nil
 }
 func (m *mockStore) EnsureIndexes() error { return nil }
 func (m *mockStore) Close() error         { return nil }

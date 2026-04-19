@@ -2,10 +2,12 @@ package propagation
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -20,6 +22,12 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
+// reaperLeaseName is the well-known key every replica uses to coordinate
+// reaper ownership. A single lease per deployment — if you run separate
+// propagation deployments against the same store, give them distinct consumer
+// groups (which already differ by namespace) or override this constant.
+const reaperLeaseName = "propagation-reaper"
+
 type propagationMsg struct {
 	TXID  string `json:"txid"`
 	RawTx string `json:"raw_tx"`
@@ -30,18 +38,27 @@ type Propagator struct {
 	logger         *zap.Logger
 	producer       *kafka.Producer
 	store          store.Store
+	leaser         store.Leaser
 	teranodeClient *teranode.Client
 	merkleClient   *merkleservice.Client
 	consumer       *kafka.ConsumerGroup
-	retryBuf       *RetryBuffer
 
 	mu                sync.Mutex
 	pendingMsgs       []propagationMsg
 	merkleConcurrency int
 	retryMaxAttempts  int
+	retryBackoffMs    int
+	reaperInterval    time.Duration
+	reaperBatchSize   int
+	holderID          string
+	leaseTTL          time.Duration
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, tc *teranode.Client, mc *merkleservice.Client) *Propagator {
+// New constructs a Propagator. leaser may be nil, in which case the reaper
+// runs unguarded — appropriate for tests and single-process deployments that
+// don't need coordination. In production every replica should receive a
+// non-nil Leaser so only one reaper is active at a time across the cluster.
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, leaser store.Leaser, tc *teranode.Client, mc *merkleservice.Client) *Propagator {
 	merkleConcurrency := cfg.Propagation.MerkleConcurrency
 	if merkleConcurrency <= 0 {
 		merkleConcurrency = 10
@@ -54,21 +71,53 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st st
 	if retryBackoff <= 0 {
 		retryBackoff = 500
 	}
-	retryBufSize := cfg.Propagation.RetryBufferSize
-	if retryBufSize <= 0 {
-		retryBufSize = 10000
+	reaperInterval := time.Duration(cfg.Propagation.ReaperIntervalMs) * time.Millisecond
+	if reaperInterval <= 0 {
+		reaperInterval = 30 * time.Second
+	}
+	reaperBatch := cfg.Propagation.ReaperBatchSize
+	if reaperBatch <= 0 {
+		reaperBatch = 500
+	}
+	leaseTTL := time.Duration(cfg.Propagation.LeaseTTLMs) * time.Millisecond
+	if leaseTTL <= 0 {
+		// Default to 3× the tick interval so a slow or delayed tick doesn't
+		// trigger a false-positive failover. This is the standard safety
+		// factor for heartbeat-style leases.
+		leaseTTL = 3 * reaperInterval
 	}
 	return &Propagator{
 		cfg:               cfg,
 		logger:            logger.Named("propagation"),
 		producer:          producer,
 		store:             st,
+		leaser:            leaser,
 		teranodeClient:    tc,
 		merkleClient:      mc,
-		retryBuf:          NewRetryBuffer(retryBufSize, retryBackoff),
 		merkleConcurrency: merkleConcurrency,
 		retryMaxAttempts:  retryMax,
+		retryBackoffMs:    retryBackoff,
+		reaperInterval:    reaperInterval,
+		reaperBatchSize:   reaperBatch,
+		holderID:          newHolderID(),
+		leaseTTL:          leaseTTL,
 	}
+}
+
+// newHolderID returns a lease-holder identifier stable for this process's
+// lifetime: "<hostname>-<8-hex-chars>". The random suffix disambiguates
+// restarts — if an old expired-but-not-yet-purged record still names the
+// previous incarnation by hostname alone, the new process will see it as a
+// foreign holder and wait for TTL rather than believe it already owns the
+// lease.
+func newHolderID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	var buf [4]byte
+	_, _ = rand.Read(buf[:])
+	return host + "-" + hex.EncodeToString(buf[:])
 }
 
 func (p *Propagator) Name() string { return "propagation" }
@@ -89,10 +138,15 @@ func (p *Propagator) Start(ctx context.Context) error {
 	}
 	p.consumer = consumer
 
-	// Recover any pending retries from a previous run
-	p.recoverPendingRetries(ctx)
+	// Kick off the durable-retry reaper alongside the Kafka consumer. It owns
+	// all rebroadcast work for PENDING_RETRY rows, decoupled from the incoming
+	// message flush cycle so a retry storm can't starve live traffic.
+	go p.runReaper(ctx)
 
-	p.logger.Info("propagation service started")
+	p.logger.Info("propagation service started",
+		zap.Duration("reaper_interval", p.reaperInterval),
+		zap.Int("reaper_batch_size", p.reaperBatchSize),
+	)
 	return consumer.Run(ctx)
 }
 
@@ -126,26 +180,19 @@ func (p *Propagator) handleMessage(ctx context.Context, msg *sarama.ConsumerMess
 	return nil
 }
 
-// flushBatch processes all accumulated messages as a batch,
-// then processes any ready retry entries.
+// flushBatch processes all accumulated messages as a batch. Retry work
+// belongs to the reaper goroutine — it is no longer coupled to the consumer's
+// drain-flush cycle, so live ingest doesn't have to wait on rebroadcasts.
 func (p *Propagator) flushBatch() error {
 	p.mu.Lock()
 	batch := p.pendingMsgs
 	p.pendingMsgs = nil
 	p.mu.Unlock()
 
-	ctx := context.Background()
-
-	if len(batch) > 0 {
-		if err := p.processBatch(ctx, batch); err != nil {
-			return err
-		}
+	if len(batch) == 0 {
+		return nil
 	}
-
-	// Process any ready retries
-	p.processRetries(ctx)
-
-	return nil
+	return p.processBatch(context.Background(), batch)
 }
 
 // processBatch handles a batch of propagation messages:
@@ -405,141 +452,42 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	return statuses
 }
 
-// handleRetryableFailure adds a transaction to the retry buffer or rejects it if
-// the buffer is full or max attempts are exhausted.
+// handleRetryableFailure marks a tx for durable retry. The two-call pattern
+// (BumpRetryCount then SetPendingRetryFields) lets us compute the real
+// exponential backoff from the post-increment count without double-
+// incrementing. If retry_count exceeds retryMaxAttempts, the tx is rejected
+// immediately and its retry bins are cleared.
 func (p *Propagator) handleRetryableFailure(ctx context.Context, txid, rawTxHex string) {
-	retryCount, err := p.store.IncrementRetryCount(ctx, txid)
+	rawTx, err := hex.DecodeString(rawTxHex)
 	if err != nil {
-		p.logger.Error("failed to increment retry count", zap.String("txid", txid), zap.Error(err))
+		p.logger.Error("invalid raw tx hex on retry", zap.String("txid", txid), zap.Error(err))
+		return
+	}
+
+	retryCount, err := p.store.BumpRetryCount(ctx, txid)
+	if err != nil {
+		p.logger.Error("failed to bump retry count", zap.String("txid", txid), zap.Error(err))
+		return
 	}
 
 	if retryCount > p.retryMaxAttempts {
-		if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
-			TxID:      txid,
-			Status:    models.StatusRejected,
-			ExtraInfo: "broadcast retries exhausted",
-			Timestamp: time.Now(),
-		}); err != nil {
+		if err := p.store.ClearRetryState(ctx, txid, models.StatusRejected, "broadcast retries exhausted"); err != nil {
 			p.logger.Error("failed to reject after retries exhausted", zap.String("txid", txid), zap.Error(err))
 		}
-		p.retryBuf.Remove(txid)
 		return
 	}
 
-	entry := &RetryEntry{
-		TXID:      txid,
-		RawTxHex:  rawTxHex,
-		Attempt:   retryCount,
-		NextRetry: p.retryBuf.ComputeBackoff(retryCount),
-	}
-	if !p.retryBuf.Add(entry) {
-		if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
-			TxID:      txid,
-			Status:    models.StatusRejected,
-			ExtraInfo: "retry buffer full",
-			Timestamp: time.Now(),
-		}); err != nil {
-			p.logger.Error("failed to reject (buffer full)", zap.String("txid", txid), zap.Error(err))
-		}
+	nextRetryAt := ComputeBackoff(p.retryBackoffMs, retryCount)
+	if err := p.store.SetPendingRetryFields(ctx, txid, rawTx, nextRetryAt); err != nil {
+		p.logger.Error("failed to set pending retry fields", zap.String("txid", txid), zap.Error(err))
 		return
-	}
-
-	// Set status to PENDING_RETRY
-	if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
-		TxID:      txid,
-		Status:    models.StatusPendingRetry,
-		Timestamp: time.Now(),
-	}); err != nil {
-		p.logger.Error("failed to set pending retry status", zap.String("txid", txid), zap.Error(err))
 	}
 
 	p.logger.Debug("transaction queued for retry",
 		zap.String("txid", txid),
 		zap.Int("attempt", retryCount),
-		zap.Int("buffer_size", p.retryBuf.Len()),
+		zap.Time("next_retry_at", nextRetryAt),
 	)
-}
-
-// recoverPendingRetries transitions any stale PENDING_RETRY transactions to REJECTED
-// on startup. Raw tx data is not persisted, so these cannot be retried after restart.
-func (p *Propagator) recoverPendingRetries(ctx context.Context) {
-	txs, err := p.store.GetPendingRetryTxs(ctx)
-	if err != nil {
-		p.logger.Warn("failed to query pending retries on startup", zap.Error(err))
-		return
-	}
-	if len(txs) == 0 {
-		return
-	}
-
-	rejected := 0
-	for _, tx := range txs {
-		if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
-			TxID:      tx.TxID,
-			Status:    models.StatusRejected,
-			ExtraInfo: "broadcast retries interrupted by service restart",
-			Timestamp: time.Now(),
-		}); err != nil {
-			p.logger.Error("failed to reject stale pending retry", zap.String("txid", tx.TxID), zap.Error(err))
-			continue
-		}
-		rejected++
-	}
-	if rejected > 0 {
-		p.logger.Info("rejected stale pending retries from previous run", zap.Int("count", rejected))
-	}
-}
-
-// processRetries broadcasts ready retry entries individually and handles the results.
-func (p *Propagator) processRetries(ctx context.Context) {
-	ready := p.retryBuf.Ready()
-	if len(ready) == 0 {
-		return
-	}
-
-	p.logger.Debug("processing retries", zap.Int("count", len(ready)))
-
-	for _, entry := range ready {
-		rawTx, err := hex.DecodeString(entry.RawTxHex)
-		if err != nil {
-			p.logger.Error("invalid raw tx hex in retry buffer", zap.String("txid", entry.TXID))
-			p.retryBuf.Remove(entry.TXID)
-			continue
-		}
-
-		br := p.broadcastSingleToEndpoints(ctx, rawTx, entry.TXID)
-
-		if br.Status != nil && br.Status.Status == models.StatusAcceptedByNetwork {
-			// Success
-			p.retryBuf.Remove(entry.TXID)
-			if err := p.store.UpdateStatus(ctx, br.Status); err != nil {
-				p.logger.Error("failed to update status after retry success", zap.String("txid", entry.TXID), zap.Error(err))
-			}
-			p.logger.Debug("retry succeeded", zap.String("txid", entry.TXID), zap.Int("attempt", entry.Attempt))
-			continue
-		}
-
-		// Still failing
-		p.retryBuf.Remove(entry.TXID)
-		if IsRetryableError(br.ErrorMsg) {
-			p.handleRetryableFailure(ctx, entry.TXID, entry.RawTxHex)
-		} else {
-			// Permanent failure on retry
-			status := models.StatusRejected
-			extraInfo := ""
-			if br.ErrorMsg != "" {
-				extraInfo = br.ErrorMsg
-			}
-			if err := p.store.UpdateStatus(ctx, &models.TransactionStatus{
-				TxID:      entry.TXID,
-				Status:    status,
-				ExtraInfo: extraInfo,
-				Timestamp: time.Now(),
-			}); err != nil {
-				p.logger.Error("failed to reject after retry", zap.String("txid", entry.TXID), zap.Error(err))
-			}
-		}
-	}
 }
 
 // statusPriority returns a numeric priority for broadcast result aggregation.

@@ -3,6 +3,7 @@ package propagation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -54,17 +55,29 @@ func (e *eventLog) count(prefix string) int {
 	return n
 }
 
-// mockStore implements store.Store with only UpdateStatus having real logic.
+// mockStore implements store.Store with UpdateStatus and the durable-retry
+// methods backed by in-memory maps. Everything else delegates to the embedded
+// interface (panics on nil if called unexpectedly, surfacing missing stubs).
 type mockStore struct {
 	store.Store // embed interface — all unimplemented methods panic if called
 	mu             sync.Mutex
 	updates        []*models.TransactionStatus
 	retryCounts    map[string]int
-	pendingRetries []*models.TransactionStatus
+	pendingRetries map[string]*store.PendingRetry
+	cleared        []clearedCall
+}
+
+type clearedCall struct {
+	txid        string
+	finalStatus models.Status
+	extraInfo   string
 }
 
 func newMockStore() *mockStore {
-	return &mockStore{retryCounts: make(map[string]int)}
+	return &mockStore{
+		retryCounts:    make(map[string]int),
+		pendingRetries: make(map[string]*store.PendingRetry),
+	}
 }
 
 func (m *mockStore) EnsureIndexes() error { return nil }
@@ -76,17 +89,137 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 	return nil
 }
 
-func (m *mockStore) IncrementRetryCount(_ context.Context, txid string) (int, error) {
+func (m *mockStore) BumpRetryCount(_ context.Context, txid string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.retryCounts[txid]++
 	return m.retryCounts[txid], nil
 }
 
-func (m *mockStore) GetPendingRetryTxs(_ context.Context) ([]*models.TransactionStatus, error) {
+func (m *mockStore) SetPendingRetryFields(_ context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.pendingRetries, nil
+	m.pendingRetries[txid] = &store.PendingRetry{
+		TxID:        txid,
+		RawTx:       append([]byte(nil), rawTx...),
+		RetryCount:  m.retryCounts[txid],
+		NextRetryAt: nextRetryAt,
+	}
+	// Reflect PENDING_RETRY status in the updates stream so existing tests that
+	// inspect status updates continue to observe the transition.
+	m.updates = append(m.updates, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusPendingRetry,
+		Timestamp: time.Now(),
+	})
+	return nil
+}
+
+func (m *mockStore) GetReadyRetries(_ context.Context, now time.Time, limit int) ([]*store.PendingRetry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*store.PendingRetry, 0, len(m.pendingRetries))
+	for _, pr := range m.pendingRetries {
+		if !pr.NextRetryAt.After(now) {
+			cp := *pr
+			out = append(out, &cp)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (m *mockStore) ClearRetryState(_ context.Context, txid string, finalStatus models.Status, extraInfo string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.pendingRetries, txid)
+	m.cleared = append(m.cleared, clearedCall{txid: txid, finalStatus: finalStatus, extraInfo: extraInfo})
+	m.updates = append(m.updates, &models.TransactionStatus{
+		TxID:      txid,
+		Status:    finalStatus,
+		ExtraInfo: extraInfo,
+		Timestamp: time.Now(),
+	})
+	return nil
+}
+
+// forceReady makes every pending retry eligible for the next reaper tick.
+func (m *mockStore) forceReady() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	past := time.Now().Add(-time.Second)
+	for _, pr := range m.pendingRetries {
+		pr.NextRetryAt = past
+	}
+}
+
+func (m *mockStore) pendingRetryCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pendingRetries)
+}
+
+// mockLeaser implements store.Leaser with a scripted per-call outcome so tests
+// can simulate "always leader", "never leader", "handover mid-run", and
+// "infra error" without time-based flakes.
+type mockLeaser struct {
+	mu        sync.Mutex
+	responses []leaseResponse
+	calls     []leaseCall
+	releases  []leaseCall
+}
+
+type leaseResponse struct {
+	heldUntil time.Time
+	err       error
+}
+
+type leaseCall struct {
+	name   string
+	holder string
+	ttl    time.Duration
+}
+
+// alwaysLeader returns a mockLeaser that reports leadership for every call —
+// used to keep existing reaper tests behaving as they did before leader
+// election was introduced.
+func alwaysLeader() *mockLeaser {
+	return &mockLeaser{}
+}
+
+// scriptedLeaser returns a mockLeaser that replays the given responses in
+// order. After the script is exhausted it continues returning the last entry.
+func scriptedLeaser(responses ...leaseResponse) *mockLeaser {
+	return &mockLeaser{responses: append([]leaseResponse(nil), responses...)}
+}
+
+func (m *mockLeaser) TryAcquireOrRenew(_ context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, leaseCall{name: name, holder: holder, ttl: ttl})
+	if len(m.responses) == 0 {
+		return time.Now().Add(ttl), nil
+	}
+	resp := m.responses[0]
+	if len(m.responses) > 1 {
+		m.responses = m.responses[1:]
+	}
+	return resp.heldUntil, resp.err
+}
+
+func (m *mockLeaser) Release(_ context.Context, name, holder string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releases = append(m.releases, leaseCall{name: name, holder: holder})
+	return nil
+}
+
+func (m *mockLeaser) callCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.calls)
 }
 
 func (m *mockStore) updateCount() int {
@@ -168,7 +301,7 @@ func newPropagator(merkleSrvURL string, teranodeSrvURL string, st store.Store) *
 
 	tc := teranode.NewClient([]string{teranodeSrvURL}, "")
 
-	return New(cfg, zap.NewNop(), nil, st, tc, mc)
+	return New(cfg, zap.NewNop(), nil, st, nil, tc, mc)
 }
 
 // handleAndFlush is a helper that adds a message and flushes (simulating consumer behavior)
@@ -268,7 +401,7 @@ func TestHandleMessage_MerkleTimeout_NoBroadcast(t *testing.T) {
 	cfg.Propagation.MerkleConcurrency = 10
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 100*time.Millisecond)
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "")
-	p := New(cfg, zap.NewNop(), nil, ms, tc, mc)
+	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, mc)
 
 	err := handleAndFlush(t, p, makePropMsg("abc123"))
 	if err == nil {
@@ -369,7 +502,7 @@ func TestHandleMessage_NoCallbackURL_SkipsRegistration(t *testing.T) {
 	cfg.Propagation.MerkleConcurrency = 10
 	mc := merkleservice.NewClient(merkleSrv.URL, "", 5*time.Second)
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "")
-	p := New(cfg, zap.NewNop(), nil, ms, tc, mc)
+	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, mc)
 
 	err := handleAndFlush(t, p, makePropMsg("abc123"))
 	if err != nil {
@@ -611,7 +744,7 @@ func TestBatchTransactions_AnySuccess_AcceptedByNetwork(t *testing.T) {
 	cfg.Propagation.MerkleConcurrency = 10
 	// Two endpoints pointing to the same server (simulates multi-endpoint)
 	tc := teranode.NewClient([]string{teranodeSrv.URL, teranodeSrv.URL}, "")
-	p := New(cfg, zap.NewNop(), nil, ms, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
 
 	for i := 0; i < 3; i++ {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
@@ -687,119 +820,87 @@ func newTeranodeServerToggle(failCount *atomic.Int32, maxFails int32, errMsg str
 	}))
 }
 
-// Test 16: Missing inputs → PENDING_RETRY → retry succeeds → ACCEPTED_BY_NETWORK
-func TestRetry_MissingInputs_ThenSuccess(t *testing.T) {
+// Retryable-error first broadcast writes a durable PENDING_RETRY row via the
+// new store API (BumpRetryCount + SetPendingRetryFields); reaper picks it up
+// and, on a successful rebroadcast, clears the retry state to ACCEPTED_BY_NETWORK.
+func TestRetry_MissingInputs_ThenReaperSuccess(t *testing.T) {
 	ms := newMockStore()
 	failCount := &atomic.Int32{}
 
-	// Fail first call with "missing inputs", succeed on second
+	// First call returns "missing inputs", subsequent calls succeed.
 	teranodeSrv := newTeranodeServerToggle(failCount, 1, "missing inputs for tx")
 	defer teranodeSrv.Close()
 
 	p := newPropagator("", teranodeSrv.URL, ms)
 
-	// First flush: broadcast fails with retryable error → PENDING_RETRY
-	err := handleAndFlush(t, p, makePropMsg("tx-retry"))
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
+	if err := handleAndFlush(t, p, makePropMsg("tx-retry")); err != nil {
+		t.Fatalf("flush error: %v", err)
 	}
 
-	// Verify PENDING_RETRY status was set
-	pendingUpdate := ms.lastUpdateForTxid("tx-retry")
-	if pendingUpdate == nil {
-		t.Fatal("expected status update for tx-retry")
+	if ms.pendingRetryCount() != 1 {
+		t.Fatalf("expected 1 durable pending retry row, got %d", ms.pendingRetryCount())
 	}
-	if pendingUpdate.Status != models.StatusPendingRetry {
-		t.Fatalf("expected PENDING_RETRY, got %s", pendingUpdate.Status)
+	if ms.retryCounts["tx-retry"] != 1 {
+		t.Fatalf("expected retry_count=1 after first failure, got %d", ms.retryCounts["tx-retry"])
 	}
 
-	// Verify tx is in retry buffer
-	if p.retryBuf.Len() != 1 {
-		t.Fatalf("expected 1 entry in retry buffer, got %d", p.retryBuf.Len())
-	}
+	// Simulate enough time having elapsed for the reaper to consider the row ready.
+	ms.forceReady()
+	p.reapOnce(context.Background())
 
-	// Manually set retry entry to be ready now
-	ready := p.retryBuf.Ready()
-	if len(ready) == 0 {
-		// Force the entry to be ready by updating its NextRetry
-		p.retryBuf.mu.Lock()
-		for _, e := range p.retryBuf.entries {
-			e.NextRetry = time.Now().Add(-1 * time.Second)
-		}
-		p.retryBuf.mu.Unlock()
+	if ms.pendingRetryCount() != 0 {
+		t.Fatalf("expected pending retry row cleared after reaper success, got %d", ms.pendingRetryCount())
 	}
-
-	// Second flush: retry succeeds → ACCEPTED_BY_NETWORK
-	if err := p.flushBatch(); err != nil {
-		t.Fatalf("second flush error: %v", err)
-	}
-
+	// Last transition should be ACCEPTED_BY_NETWORK (via ClearRetryState).
 	lastUpdate := ms.lastUpdateForTxid("tx-retry")
 	if lastUpdate == nil || lastUpdate.Status != models.StatusAcceptedByNetwork {
-		t.Fatalf("expected ACCEPTED_BY_NETWORK after retry, got %v", lastUpdate)
-	}
-
-	if p.retryBuf.Len() != 0 {
-		t.Fatalf("expected empty retry buffer after success, got %d", p.retryBuf.Len())
+		t.Fatalf("expected ACCEPTED_BY_NETWORK after reaper, got %+v", lastUpdate)
 	}
 }
 
-// Test 17: Missing inputs repeatedly → retries exhausted → REJECTED
-func TestRetry_MissingInputs_RetriesExhausted(t *testing.T) {
+// Retryable error repeated until retry_count exceeds the configured max →
+// ClearRetryState(REJECTED, "broadcast retries exhausted"). Covers the
+// "don't loop forever" invariant that replaced the old retry-buffer-full path.
+func TestRetry_Exhausted_ClearsToRejected(t *testing.T) {
 	ms := newMockStore()
 
-	// Always fail with "missing inputs"
 	teranodeSrv := newTeranodeServerWithError("missing inputs for tx")
 	defer teranodeSrv.Close()
 
 	cfg := &config.Config{}
 	cfg.Propagation.MerkleConcurrency = 10
-	cfg.Propagation.RetryMaxAttempts = 3
-	cfg.Propagation.RetryBackoffMs = 1 // 1ms for fast test
-	cfg.Propagation.RetryBufferSize = 100
+	cfg.Propagation.RetryMaxAttempts = 2
+	cfg.Propagation.RetryBackoffMs = 1
 	tc := teranode.NewClient([]string{teranodeSrv.URL}, "")
-	p := New(cfg, zap.NewNop(), nil, ms, tc, nil)
+	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
 
-	// Initial broadcast → PENDING_RETRY
-	err := handleAndFlush(t, p, makePropMsg("tx-exhaust"))
-	if err != nil {
+	// Initial broadcast → PENDING_RETRY at retry_count=1.
+	if err := handleAndFlush(t, p, makePropMsg("tx-exhaust")); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
-	// Retry until exhausted
-	for i := 0; i < 10; i++ {
-		// Force entries to be ready
-		p.retryBuf.mu.Lock()
-		for _, e := range p.retryBuf.entries {
-			e.NextRetry = time.Now().Add(-1 * time.Second)
-		}
-		p.retryBuf.mu.Unlock()
+	// Reaper fires; Teranode still failing → handleRetryableFailure bumps to 2.
+	ms.forceReady()
+	p.reapOnce(context.Background())
 
-		if err := p.flushBatch(); err != nil {
-			t.Fatalf("flush %d error: %v", i, err)
-		}
-		if p.retryBuf.Len() == 0 {
-			break
-		}
+	// One more reaper tick → retry_count becomes 3, exceeds max=2, REJECT.
+	ms.forceReady()
+	p.reapOnce(context.Background())
+
+	if ms.pendingRetryCount() != 0 {
+		t.Fatalf("expected no pending retries after exhaustion, got %d", ms.pendingRetryCount())
 	}
-
-	if p.retryBuf.Len() != 0 {
-		t.Fatalf("expected empty buffer after exhaustion, got %d", p.retryBuf.Len())
-	}
-
 	lastUpdate := ms.lastUpdateForTxid("tx-exhaust")
-	if lastUpdate == nil {
-		t.Fatal("expected final status update")
-	}
-	if lastUpdate.Status != models.StatusRejected {
-		t.Fatalf("expected REJECTED after retries exhausted, got %s", lastUpdate.Status)
+	if lastUpdate == nil || lastUpdate.Status != models.StatusRejected {
+		t.Fatalf("expected REJECTED, got %+v", lastUpdate)
 	}
 	if !strings.Contains(lastUpdate.ExtraInfo, "broadcast retries exhausted") {
 		t.Fatalf("expected 'broadcast retries exhausted' in ExtraInfo, got %q", lastUpdate.ExtraInfo)
 	}
 }
 
-// Test 18: Permanent error → immediate REJECTED (no retry)
+// Non-retryable error on the first broadcast → immediate REJECTED via the
+// existing processBatch path (no PENDING_RETRY row is ever written).
 func TestRetry_PermanentError_ImmediateReject(t *testing.T) {
 	ms := newMockStore()
 
@@ -808,129 +909,194 @@ func TestRetry_PermanentError_ImmediateReject(t *testing.T) {
 
 	p := newPropagator("", teranodeSrv.URL, ms)
 
-	err := handleAndFlush(t, p, makePropMsg("tx-perm"))
-	if err != nil {
+	if err := handleAndFlush(t, p, makePropMsg("tx-perm")); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
-	// Should be immediately rejected, not in retry buffer
-	if p.retryBuf.Len() != 0 {
-		t.Fatalf("expected empty retry buffer for permanent error, got %d", p.retryBuf.Len())
+	if ms.pendingRetryCount() != 0 {
+		t.Fatalf("expected no pending retry row for permanent error, got %d", ms.pendingRetryCount())
 	}
-
 	lastUpdate := ms.lastUpdateForTxid("tx-perm")
-	if lastUpdate == nil {
-		t.Fatal("expected status update")
-	}
-	if lastUpdate.Status != models.StatusRejected {
-		t.Fatalf("expected REJECTED, got %s", lastUpdate.Status)
+	if lastUpdate == nil || lastUpdate.Status != models.StatusRejected {
+		t.Fatalf("expected REJECTED, got %+v", lastUpdate)
 	}
 }
 
-// Test 19: Retry buffer full → immediate REJECTED
-func TestRetry_BufferFull_ImmediateReject(t *testing.T) {
+// A reaper tick with no ready rows is a no-op — it must not call Teranode.
+func TestReaper_EmptyStore_NoBroadcast(t *testing.T) {
 	ms := newMockStore()
 
-	teranodeSrv := newTeranodeServerWithError("missing inputs for tx")
+	log := &eventLog{}
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
 	defer teranodeSrv.Close()
 
-	cfg := &config.Config{}
-	cfg.Propagation.MerkleConcurrency = 10
-	cfg.Propagation.RetryMaxAttempts = 5
-	cfg.Propagation.RetryBackoffMs = 500
-	cfg.Propagation.RetryBufferSize = 1 // buffer size of 1
-	tc := teranode.NewClient([]string{teranodeSrv.URL}, "")
-	p := New(cfg, zap.NewNop(), nil, ms, tc, nil)
+	p := newPropagator("", teranodeSrv.URL, ms)
+	p.reapOnce(context.Background())
 
-	// First tx fills the buffer
-	err := handleAndFlush(t, p, makePropMsg("tx-fill"))
-	if err != nil {
-		t.Fatalf("flush error: %v", err)
-	}
-	if p.retryBuf.Len() != 1 {
-		t.Fatalf("expected 1 entry in buffer, got %d", p.retryBuf.Len())
-	}
-
-	// Second tx: buffer full → immediate reject
-	err = handleAndFlush(t, p, makePropMsg("tx-overflow"))
-	if err != nil {
-		t.Fatalf("flush error: %v", err)
-	}
-
-	lastUpdate := ms.lastUpdateForTxid("tx-overflow")
-	if lastUpdate == nil {
-		t.Fatal("expected status update for tx-overflow")
-	}
-	if lastUpdate.Status != models.StatusRejected {
-		t.Fatalf("expected REJECTED for overflow tx, got %s", lastUpdate.Status)
-	}
-	if !strings.Contains(lastUpdate.ExtraInfo, "retry buffer full") {
-		t.Fatalf("expected 'retry buffer full' in ExtraInfo, got %q", lastUpdate.ExtraInfo)
+	if log.count("broadcast") != 0 || log.count("broadcast-batch") != 0 {
+		t.Errorf("reaper should not broadcast when no retries ready, got events: %v", log.all())
 	}
 }
 
-// Test 20: Startup recovery rejects stale PENDING_RETRY transactions
-func TestStartupRecovery_RejectsStaleRetries(t *testing.T) {
-	ms := newMockStore()
-	ms.pendingRetries = []*models.TransactionStatus{
-		{TxID: "stale-tx-1", Status: models.StatusPendingRetry},
-		{TxID: "stale-tx-2", Status: models.StatusPendingRetry},
-	}
-
-	teranodeSrv := newTeranodeServer(&eventLog{}, http.StatusOK)
-	defer teranodeSrv.Close()
-
-	cfg := &config.Config{}
-	cfg.Propagation.MerkleConcurrency = 10
-	cfg.Propagation.RetryMaxAttempts = 5
-	cfg.Propagation.RetryBackoffMs = 500
-	cfg.Propagation.RetryBufferSize = 100
-	tc := teranode.NewClient([]string{teranodeSrv.URL}, "")
-	p := New(cfg, zap.NewNop(), nil, ms, tc, nil)
-
-	// Simulate startup recovery
-	p.recoverPendingRetries(context.Background())
-
-	// Both should be rejected
-	for _, txid := range []string{"stale-tx-1", "stale-tx-2"} {
-		update := ms.lastUpdateForTxid(txid)
-		if update == nil {
-			t.Fatalf("expected status update for %s", txid)
-		}
-		if update.Status != models.StatusRejected {
-			t.Fatalf("expected REJECTED for %s, got %s", txid, update.Status)
-		}
-		if !strings.Contains(update.ExtraInfo, "service restart") {
-			t.Fatalf("expected 'service restart' in ExtraInfo for %s, got %q", txid, update.ExtraInfo)
-		}
-	}
-}
-
-// Test 21: GET /tx/:txid returns PENDING_RETRY during retry window
-// (verified via the mockStore — the status is set correctly, API layer reads it)
-func TestRetry_StatusIsPendingRetry_DuringRetryWindow(t *testing.T) {
+// The reaper uses the batch /txs endpoint when more than one row is ready.
+func TestReaper_BatchSuccess_ClearsAllToAccepted(t *testing.T) {
 	ms := newMockStore()
 
-	teranodeSrv := newTeranodeServerWithError("missing inputs for tx")
+	log := &eventLog{}
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
 	defer teranodeSrv.Close()
 
 	p := newPropagator("", teranodeSrv.URL, ms)
 
-	err := handleAndFlush(t, p, makePropMsg("tx-status"))
-	if err != nil {
-		t.Fatalf("flush error: %v", err)
-	}
-
-	// Find the PENDING_RETRY update
-	found := false
-	for _, u := range ms.updatesForTxid("tx-status") {
-		if u.Status == models.StatusPendingRetry {
-			found = true
-			break
+	// Seed the store with two ready PENDING_RETRY rows.
+	for _, txid := range []string{"tx-a", "tx-b"} {
+		ms.retryCounts[txid] = 1
+		if err := ms.SetPendingRetryFields(context.Background(), txid, []byte{0xaa}, time.Now().Add(-time.Second)); err != nil {
+			t.Fatalf("seed pending retry: %v", err)
 		}
 	}
-	if !found {
-		t.Fatal("expected at least one PENDING_RETRY status update")
+
+	p.reapOnce(context.Background())
+
+	if log.count("broadcast-batch") != 1 {
+		t.Errorf("expected exactly 1 /txs call, got %d (events=%v)", log.count("broadcast-batch"), log.all())
+	}
+	if ms.pendingRetryCount() != 0 {
+		t.Errorf("expected pending retries cleared, got %d", ms.pendingRetryCount())
+	}
+	for _, txid := range []string{"tx-a", "tx-b"} {
+		u := ms.lastUpdateForTxid(txid)
+		if u == nil || u.Status != models.StatusAcceptedByNetwork {
+			t.Errorf("expected ACCEPTED_BY_NETWORK for %s, got %+v", txid, u)
+		}
 	}
 }
 
+// newPropagatorWithLeaser is like newPropagator but installs a given leaser
+// so leader-election scenarios can be tested.
+func newPropagatorWithLeaser(teranodeSrvURL string, st store.Store, leaser store.Leaser) *Propagator {
+	cfg := &config.Config{CallbackURL: "http://localhost:8080/callback"}
+	cfg.Propagation.MerkleConcurrency = 10
+	tc := teranode.NewClient([]string{teranodeSrvURL}, "")
+	return New(cfg, zap.NewNop(), nil, st, leaser, tc, nil)
+}
+
+// When the leaser refuses to grant leadership, the reaper must not broadcast
+// or touch the store — every tick is a no-op.
+func TestReaper_NotLeader_SkipsReap(t *testing.T) {
+	ms := newMockStore()
+
+	log := &eventLog{}
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	// Seed a ready PENDING_RETRY row that WOULD be picked up if we were leader.
+	ms.retryCounts["tx-follower"] = 1
+	if err := ms.SetPendingRetryFields(context.Background(), "tx-follower", []byte{0xaa}, time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	leaser := scriptedLeaser(leaseResponse{heldUntil: time.Time{}})
+	p := newPropagatorWithLeaser(teranodeSrv.URL, ms, leaser)
+	p.tryReap(context.Background())
+
+	if log.count("broadcast") != 0 || log.count("broadcast-batch") != 0 {
+		t.Errorf("non-leader must not broadcast, got events: %v", log.all())
+	}
+	if ms.pendingRetryCount() != 1 {
+		t.Errorf("non-leader must not clear retry rows, pending count=%d", ms.pendingRetryCount())
+	}
+	if leaser.callCount() != 1 {
+		t.Errorf("expected 1 lease check, got %d", leaser.callCount())
+	}
+}
+
+// Explicit test that leader-granted ticks still run the reap logic unchanged.
+func TestReaper_Leader_RunsReap(t *testing.T) {
+	ms := newMockStore()
+
+	log := &eventLog{}
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	ms.retryCounts["tx-leader"] = 1
+	if err := ms.SetPendingRetryFields(context.Background(), "tx-leader", []byte{0xaa}, time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	p := newPropagatorWithLeaser(teranodeSrv.URL, ms, alwaysLeader())
+	p.tryReap(context.Background())
+
+	// Single-row broadcast goes via /tx, not /txs.
+	if log.count("broadcast") != 1 {
+		t.Errorf("expected 1 broadcast when leader, got events: %v", log.all())
+	}
+	if ms.pendingRetryCount() != 0 {
+		t.Errorf("expected retry cleared after leader reap, got %d", ms.pendingRetryCount())
+	}
+}
+
+// Lease infrastructure errors are logged but must not crash the reaper or
+// trigger a split-brain broadcast.
+func TestReaper_LeaseError_SkipsReap(t *testing.T) {
+	ms := newMockStore()
+
+	log := &eventLog{}
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	ms.retryCounts["tx-err"] = 1
+	if err := ms.SetPendingRetryFields(context.Background(), "tx-err", []byte{0xaa}, time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	leaser := scriptedLeaser(leaseResponse{err: errors.New("aerospike down")})
+	p := newPropagatorWithLeaser(teranodeSrv.URL, ms, leaser)
+	p.tryReap(context.Background())
+
+	if log.count("broadcast") != 0 || log.count("broadcast-batch") != 0 {
+		t.Errorf("lease error must not result in broadcast, got events: %v", log.all())
+	}
+}
+
+// Handover: first tick is leader and does work, second tick has lost
+// leadership (simulating another pod taking over) and must become a no-op.
+func TestReaper_LeaseHandover(t *testing.T) {
+	ms := newMockStore()
+
+	log := &eventLog{}
+	teranodeSrv := newTeranodeServer(log, http.StatusOK)
+	defer teranodeSrv.Close()
+
+	ms.retryCounts["tx-handover"] = 1
+	if err := ms.SetPendingRetryFields(context.Background(), "tx-handover", []byte{0xaa}, time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	leaser := scriptedLeaser(
+		leaseResponse{heldUntil: time.Now().Add(90 * time.Second)}, // tick 1: leader
+		leaseResponse{heldUntil: time.Time{}},                      // tick 2: lost
+	)
+	p := newPropagatorWithLeaser(teranodeSrv.URL, ms, leaser)
+
+	// Tick 1: leader → reap runs, clears the row, broadcasts once.
+	p.tryReap(context.Background())
+	if log.count("broadcast") != 1 {
+		t.Fatalf("tick 1 (leader) expected 1 broadcast, got %v", log.all())
+	}
+
+	// Re-seed another ready row to verify tick 2 does NOT pick it up.
+	ms.retryCounts["tx-handover-2"] = 1
+	if err := ms.SetPendingRetryFields(context.Background(), "tx-handover-2", []byte{0xaa}, time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("seed 2: %v", err)
+	}
+
+	// Tick 2: lost leadership → no more broadcasts, row stays pending.
+	p.tryReap(context.Background())
+	if log.count("broadcast") != 1 {
+		t.Errorf("tick 2 (follower) must not broadcast, got events: %v", log.all())
+	}
+	if ms.pendingRetryCount() != 1 {
+		t.Errorf("tick 2 must leave row pending, got %d", ms.pendingRetryCount())
+	}
+}

@@ -29,10 +29,12 @@ const (
 	setStumps         = "stumps"
 	setSubmissions    = "submissions"
 	setProcessedBlocks = "processed_blocks"
+	setLeases         = "leases"
 )
 
-// Ensure AerospikeStore implements Store
+// Ensure AerospikeStore implements Store and Leaser
 var _ Store = (*AerospikeStore)(nil)
+var _ Leaser = (*AerospikeStore)(nil)
 
 type AerospikeStore struct {
 	client    *aero.Client
@@ -263,14 +265,18 @@ func (s *AerospikeStore) SetStatusByBlockHash(_ context.Context, blockHash strin
 	return txids, nil
 }
 
-func (s *AerospikeStore) IncrementRetryCount(_ context.Context, txid string) (int, error) {
+// BumpRetryCount atomically increments retry_count and returns the new value.
+// Bin writes for status / raw_tx / next_retry_at are handled separately by
+// SetPendingRetryFields so callers can compute the correct backoff from the
+// post-increment count.
+func (s *AerospikeStore) BumpRetryCount(_ context.Context, txid string) (int, error) {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return 0, err
 	}
 	rec, err := s.client.Operate(nil, key, aero.AddOp(aero.NewBin("retry_count", 1)), aero.GetOp())
 	if err != nil {
-		return 0, fmt.Errorf("increment retry count %s: %w", txid, err)
+		return 0, fmt.Errorf("bump retry count %s: %w", txid, err)
 	}
 	if v, ok := rec.Bins["retry_count"]; ok {
 		if n, ok := v.(int); ok {
@@ -280,7 +286,33 @@ func (s *AerospikeStore) IncrementRetryCount(_ context.Context, txid string) (in
 	return 1, nil
 }
 
-func (s *AerospikeStore) GetPendingRetryTxs(_ context.Context) ([]*models.TransactionStatus, error) {
+// SetPendingRetryFields writes the durable retry bins in one atomic call. The
+// caller is responsible for having already bumped retry_count and computed
+// next_retry_at from that post-increment value.
+func (s *AerospikeStore) SetPendingRetryFields(_ context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+	key, err := s.key(setTransactions, txid)
+	if err != nil {
+		return err
+	}
+	ops := []*aero.Operation{
+		aero.PutOp(aero.NewBin("status", string(models.StatusPendingRetry))),
+		aero.PutOp(aero.NewBin("raw_tx", rawTx)),
+		aero.PutOp(aero.NewBin("next_retry_at", nextRetryAt.UnixMilli())),
+		aero.PutOp(aero.NewBin("timestamp", time.Now().UnixMilli())),
+	}
+	if _, err := s.client.Operate(nil, key, ops...); err != nil {
+		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
+	}
+	return nil
+}
+
+// GetReadyRetries uses the existing idx_tx_status index to find PENDING_RETRY
+// rows and filters by next_retry_at in code. At expected cardinality
+// (thousands, not millions) this is cheap.
+func (s *AerospikeStore) GetReadyRetries(_ context.Context, now time.Time, limit int) ([]*PendingRetry, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
 	stmt := aero.NewStatement(s.namespace, setTransactions)
 	stmt.SetFilter(aero.NewEqualFilter("status", string(models.StatusPendingRetry)))
 
@@ -290,15 +322,56 @@ func (s *AerospikeStore) GetPendingRetryTxs(_ context.Context) ([]*models.Transa
 	}
 	defer rs.Close()
 
-	var results []*models.TransactionStatus
+	nowMs := now.UnixMilli()
+	results := make([]*PendingRetry, 0, limit)
 	for rec := range rs.Results() {
 		if rec.Err != nil {
 			return nil, rec.Err
 		}
-		txid := getString(rec.Record, "txid")
-		results = append(results, recordToStatus(rec.Record, txid))
+		nextMs := getInt64(rec.Record, "next_retry_at")
+		if nextMs > nowMs {
+			continue
+		}
+		rawTx, _ := rec.Record.Bins["raw_tx"].([]byte)
+		if len(rawTx) == 0 {
+			// Legacy PENDING_RETRY rows from before durable retries — skip.
+			continue
+		}
+		results = append(results, &PendingRetry{
+			TxID:        getString(rec.Record, "txid"),
+			RawTx:       rawTx,
+			RetryCount:  getInt(rec.Record, "retry_count"),
+			NextRetryAt: time.UnixMilli(nextMs),
+		})
+		if len(results) >= limit {
+			break
+		}
 	}
 	return results, nil
+}
+
+// ClearRetryState transitions a tx out of PENDING_RETRY and deletes the retry
+// bins so the row stops matching the reaper's query. retry_count is retained
+// for observability.
+func (s *AerospikeStore) ClearRetryState(_ context.Context, txid string, finalStatus models.Status, extraInfo string) error {
+	key, err := s.key(setTransactions, txid)
+	if err != nil {
+		return err
+	}
+	ops := []*aero.Operation{
+		aero.PutOp(aero.NewBin("status", string(finalStatus))),
+		aero.PutOp(aero.NewBin("timestamp", time.Now().UnixMilli())),
+		// Aerospike: writing a nil bin value deletes the bin.
+		aero.PutOp(aero.NewBin("raw_tx", nil)),
+		aero.PutOp(aero.NewBin("next_retry_at", nil)),
+	}
+	if extraInfo != "" {
+		ops = append(ops, aero.PutOp(aero.NewBin("extra_info", extraInfo)))
+	}
+	if _, err := s.client.Operate(nil, key, ops...); err != nil {
+		return fmt.Errorf("clear retry state %s: %w", txid, err)
+	}
+	return nil
 }
 
 func (s *AerospikeStore) SetMinedByTxIDs(_ context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
@@ -746,6 +819,89 @@ func recordToSubmission(rec *aero.Record) *models.Submission {
 	return sub
 }
 
+// --- Lease Operations ---
+
+// TryAcquireOrRenew implements store.Leaser. Uses Aerospike generation-match
+// CAS to serialise acquire / renew across concurrent writers, with the record's
+// native TTL as the authoritative expiration (no client clock dependency). The
+// expires_at bin is a belt-and-braces hint for the narrow window between TTL
+// lapse and next client scan.
+func (s *AerospikeStore) TryAcquireOrRenew(_ context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
+	key, err := s.key(setLeases, name)
+	if err != nil {
+		return time.Time{}, err
+	}
+	now := time.Now()
+	expiresAt := now.Add(ttl)
+
+	rec, err := s.client.Get(nil, key)
+	if err != nil && !isKeyNotFound(err) {
+		return time.Time{}, fmt.Errorf("read lease %s: %w", name, err)
+	}
+
+	bins := aero.BinMap{
+		"holder":     holder,
+		"expires_at": expiresAt.UnixMilli(),
+	}
+
+	if rec == nil {
+		// No lease record yet — try to create it. CREATE_ONLY fails if a
+		// concurrent writer creates the row between our Get and Put; treat
+		// that as a benign contention signal.
+		policy := aero.NewWritePolicy(0, uint32(ttl.Seconds()))
+		policy.RecordExistsAction = aero.CREATE_ONLY
+		if err := s.client.Put(policy, key, bins); err != nil {
+			return time.Time{}, nil
+		}
+		return expiresAt, nil
+	}
+
+	currentHolder := getString(rec, "holder")
+	currentExpires := getInt64(rec, "expires_at")
+	canTake := currentHolder == holder || currentExpires <= now.UnixMilli()
+	if !canTake {
+		return time.Time{}, nil
+	}
+
+	// CAS-write: succeeds only if the record hasn't changed since our read.
+	// A gen mismatch means another pod won the race; not an error.
+	policy := aero.NewWritePolicy(0, uint32(ttl.Seconds()))
+	policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+	policy.Generation = rec.Generation
+	if err := s.client.Put(policy, key, bins); err != nil {
+		return time.Time{}, nil
+	}
+	return expiresAt, nil
+}
+
+// Release deletes a lease record if it's still held by this caller. Gen-match
+// prevents us from stepping on a successor who has already acquired it after
+// our TTL lapsed. Swallows benign races (not held / raced to delete) as nil.
+func (s *AerospikeStore) Release(_ context.Context, name, holder string) error {
+	key, err := s.key(setLeases, name)
+	if err != nil {
+		return err
+	}
+	rec, err := s.client.Get(nil, key)
+	if err != nil {
+		if isKeyNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("read lease for release %s: %w", name, err)
+	}
+	if getString(rec, "holder") != holder {
+		return nil
+	}
+	policy := aero.NewWritePolicy(0, 0)
+	policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
+	policy.Generation = rec.Generation
+	if _, err := s.client.Delete(policy, key); err != nil {
+		// Gen mismatch = successor already took over. Not an error.
+		return nil
+	}
+	return nil
+}
+
 func getString(rec *aero.Record, bin string) string {
 	if v, ok := rec.Bins[bin]; ok {
 		if s, ok := v.(string); ok {
@@ -753,4 +909,27 @@ func getString(rec *aero.Record, bin string) string {
 		}
 	}
 	return ""
+}
+
+func getInt(rec *aero.Record, bin string) int {
+	if v, ok := rec.Bins[bin]; ok {
+		if n, ok := v.(int); ok {
+			return n
+		}
+	}
+	return 0
+}
+
+// getInt64 reads a 64-bit integer bin. Aerospike returns integer bins as the
+// language's native int, so we widen safely.
+func getInt64(rec *aero.Record, bin string) int64 {
+	if v, ok := rec.Bins[bin]; ok {
+		switch n := v.(type) {
+		case int:
+			return int64(n)
+		case int64:
+			return n
+		}
+	}
+	return 0
 }

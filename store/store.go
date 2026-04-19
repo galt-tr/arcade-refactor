@@ -11,6 +11,15 @@ import (
 // ErrNotFound is returned when a requested record does not exist.
 var ErrNotFound = errors.New("not found")
 
+// PendingRetry is the lightweight row shape the reaper consumes. It avoids
+// pulling full TransactionStatus objects through the retry hot path.
+type PendingRetry struct {
+	TxID        string
+	RawTx       []byte
+	RetryCount  int
+	NextRetryAt time.Time
+}
+
 // Store handles all persistence operations for transactions and submissions
 type Store interface {
 	// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
@@ -66,11 +75,25 @@ type Store interface {
 	// DeleteStumpsByBlockHash removes all STUMPs for a given block hash (used during reorg cleanup).
 	DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error
 
-	// IncrementRetryCount atomically increments the retry_count for a transaction and returns the new value.
-	IncrementRetryCount(ctx context.Context, txid string) (int, error)
+	// BumpRetryCount atomically increments retry_count and returns the new value.
+	// Does not touch any other bins — callers combine this with
+	// SetPendingRetryFields or ClearRetryState depending on the new count.
+	BumpRetryCount(ctx context.Context, txid string) (retryCount int, err error)
 
-	// GetPendingRetryTxs retrieves all transactions with PENDING_RETRY status for retry recovery on startup.
-	GetPendingRetryTxs(ctx context.Context) ([]*models.TransactionStatus, error)
+	// SetPendingRetryFields writes the durable retry bins: status=PENDING_RETRY,
+	// raw_tx, next_retry_at, timestamp. retry_count is untouched — use
+	// BumpRetryCount first to get the value that feeds next_retry_at backoff.
+	SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error
+
+	// GetReadyRetries returns up to limit PENDING_RETRY rows whose
+	// next_retry_at has elapsed. Rows include raw_tx and retry_count so the
+	// reaper can act without a second read per row.
+	GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*PendingRetry, error)
+
+	// ClearRetryState transitions a tx out of PENDING_RETRY (either on success
+	// or final rejection) and deletes the raw_tx + next_retry_at bins so the
+	// row stops showing up in ready-retry queries.
+	ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error
 
 	// EnsureIndexes creates any required secondary indexes for query operations.
 	EnsureIndexes() error

@@ -35,7 +35,9 @@ func (h *HexBytes) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// TransactionStatus represents the current status of a transaction
+// TransactionStatus represents the current status of a transaction.
+// RawTx and NextRetryAt are set only while the tx is in PENDING_RETRY and
+// cleared on any terminal transition; they drive the durable retry reaper.
 type TransactionStatus struct {
 	TxID         string    `json:"txid"`
 	Status       Status    `json:"txStatus"`
@@ -46,6 +48,9 @@ type TransactionStatus struct {
 	MerklePath   HexBytes  `json:"merklePath,omitempty"`
 	ExtraInfo    string    `json:"extraInfo,omitempty"`
 	CompetingTxs []string  `json:"competingTxs,omitempty"`
+	RawTx        HexBytes  `json:"rawTx,omitempty"`
+	RetryCount   int       `json:"retryCount,omitempty"`
+	NextRetryAt  time.Time `json:"nextRetryAt,omitempty"`
 	CreatedAt    time.Time `json:"-"`
 }
 

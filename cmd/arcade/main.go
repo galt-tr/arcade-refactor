@@ -152,7 +152,9 @@ func buildServices(
 		svcs = append(svcs, tx_validator.New(cfg, logger, producer, aeroStore, txTracker, txVal))
 	}
 	if shouldRun("propagation") {
-		svcs = append(svcs, propagation.New(cfg, logger, producer, aeroStore, teranodeClient, merkleClient))
+		// aeroStore satisfies both store.Store and store.Leaser; pass it twice
+		// so a future backend can be split across the two interfaces.
+		svcs = append(svcs, propagation.New(cfg, logger, producer, aeroStore, aeroStore, teranodeClient, merkleClient))
 	}
 
 	return svcs
