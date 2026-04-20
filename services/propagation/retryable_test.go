@@ -14,8 +14,12 @@ func TestIsRetryableError(t *testing.T) {
 		{"mempool conflict", "txn-mempool-conflict", true},
 		{"mempool conflict in message", "error: txn-mempool-conflict detected", true},
 		{"mempool conflict mixed case", "TXN-MEMPOOL-CONFLICT", true},
-		{"failed to validate", "PROCESSING (4): [ProcessTransaction][txid] failed to validate transaction", true},
-		{"failed to validate lowercase", "failed to validate transaction", true},
+		// "failed to validate transaction" is Teranode's generic wrapper for
+		// per-tx errors and matches genuine invalid txs — treating it as
+		// retryable caused bad data to churn through PENDING_RETRY for minutes.
+		// Must now be rejected on first attempt.
+		{"failed to validate is NOT retryable", "PROCESSING (4): [ProcessTransaction][txid] failed to validate transaction", false},
+		{"failed to validate lowercase is NOT retryable", "failed to validate transaction", false},
 		{"permanent error", "transaction is invalid: bad-txns-vin-empty", false},
 		{"script error", "mandatory-script-verify-flag-failed", false},
 		{"empty string", "", false},

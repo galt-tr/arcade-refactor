@@ -60,8 +60,9 @@ func (p *Propagator) tryReap(ctx context.Context) {
 }
 
 // reapOnce pulls up to reaperBatchSize PENDING_RETRY rows whose next_retry_at
-// has elapsed, broadcasts them as a single batch, and resolves each row based
-// on the outcome. Batch-all-rejected falls back to per-tx to classify errors.
+// has elapsed, broadcasts them in teranodeBatchCap-sized chunks, and resolves
+// each row based on the outcome. Batch-all-rejected falls back to per-tx
+// within the failing chunk only.
 func (p *Propagator) reapOnce(ctx context.Context) {
 	ready, err := p.store.GetReadyRetries(ctx, time.Now(), p.reaperBatchSize)
 	if err != nil {
@@ -81,36 +82,12 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 		batch[i] = propagationMsg{TXID: r.TxID, RawTx: hex.EncodeToString(r.RawTx)}
 	}
 
-	// Try the batch endpoint first. If all endpoints reject the batch, fall
-	// back to per-tx broadcasts so we can read each error message and classify
-	// retryable vs. terminal — same pattern as processBatch.
-	results := make([]retryResult, len(ready))
-	if len(ready) == 1 {
-		br := p.broadcastSingleToEndpoints(ctx, rawTxs[0], ready[0].TxID)
-		results[0] = retryResult{status: br.Status, errMsg: br.ErrorMsg}
-	} else {
-		batchStatuses := p.broadcastBatchToEndpoints(ctx, rawTxs, batch)
-		allRejected := true
-		for _, s := range batchStatuses {
-			if s != nil && s.Status != models.StatusRejected {
-				allRejected = false
-				break
-			}
-		}
-		if allRejected && len(batchStatuses) > 0 {
-			for i, r := range ready {
-				br := p.broadcastSingleToEndpoints(ctx, rawTxs[i], r.TxID)
-				results[i] = retryResult{status: br.Status, errMsg: br.ErrorMsg}
-			}
-		} else {
-			for i, s := range batchStatuses {
-				results[i] = retryResult{status: s}
-			}
-		}
-	}
-
+	// Reuse the same chunk-and-fallback path as processBatch — the retry
+	// flow doesn't need its own broadcast machinery, just a different
+	// outcome resolver.
+	results := p.broadcastInChunks(ctx, batch, rawTxs)
 	for i, r := range ready {
-		p.resolveRetryOutcome(ctx, r, results[i])
+		p.resolveRetryOutcome(ctx, r, retryResult{status: results[i].status, errMsg: results[i].errMsg})
 	}
 }
 

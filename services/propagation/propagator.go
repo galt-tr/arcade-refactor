@@ -50,6 +50,7 @@ type Propagator struct {
 	retryBackoffMs    int
 	reaperInterval    time.Duration
 	reaperBatchSize   int
+	teranodeBatchCap  int
 	holderID          string
 	leaseTTL          time.Duration
 }
@@ -86,6 +87,10 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st st
 		// factor for heartbeat-style leases.
 		leaseTTL = 3 * reaperInterval
 	}
+	teranodeBatchCap := cfg.Propagation.TeranodeMaxBatchSize
+	if teranodeBatchCap <= 0 {
+		teranodeBatchCap = 100
+	}
 	return &Propagator{
 		cfg:               cfg,
 		logger:            logger.Named("propagation"),
@@ -99,6 +104,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st st
 		retryBackoffMs:    retryBackoff,
 		reaperInterval:    reaperInterval,
 		reaperBatchSize:   reaperBatch,
+		teranodeBatchCap:  teranodeBatchCap,
 		holderID:          newHolderID(),
 		leaseTTL:          leaseTTL,
 	}
@@ -195,9 +201,17 @@ func (p *Propagator) flushBatch() error {
 	return p.processBatch(context.Background(), batch)
 }
 
+// txResult carries per-tx outcome of a broadcast, used by both the initial
+// processBatch path and the reaper.
+type txResult struct {
+	status   *models.TransactionStatus
+	errMsg   string
+	rawTxHex string
+}
+
 // processBatch handles a batch of propagation messages:
 // 1. Register all txids with merkle service concurrently
-// 2. Broadcast all raw txs to teranode endpoints in batch
+// 2. Broadcast all raw txs to teranode endpoints, chunked to teranodeBatchCap
 // 3. Update status for each transaction
 func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) error {
 	// Log batch summary for traceability
@@ -228,47 +242,14 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 		p.logger.Debug("batch registered with merkle-service", zap.Int("count", len(batch)))
 	}
 
-	// Step 2: Broadcast all raw txs to teranode endpoints
+	// Step 2: Broadcast in chunks bounded by teranodeBatchCap so a single
+	// oversized Kafka flush doesn't blow past Teranode's /txs size limit.
 	rawTxs := make([][]byte, len(batch))
 	for i, msg := range batch {
 		rawTx, _ := hex.DecodeString(msg.RawTx) // already validated in handleMessage
 		rawTxs[i] = rawTx
 	}
-
-	type txResult struct {
-		status   *models.TransactionStatus
-		errMsg   string
-		rawTxHex string
-	}
-
-	var results []txResult
-	if len(batch) == 1 {
-		br := p.broadcastSingleToEndpoints(ctx, rawTxs[0], batch[0].TXID)
-		results = []txResult{{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: batch[0].RawTx}}
-	} else {
-		// Batch broadcast — if it fails, fall back to single-tx for per-tx error classification
-		batchStatuses := p.broadcastBatchToEndpoints(ctx, rawTxs, batch)
-		allRejected := true
-		for _, s := range batchStatuses {
-			if s != nil && s.Status != models.StatusRejected {
-				allRejected = false
-				break
-			}
-		}
-		if allRejected && len(batchStatuses) > 0 {
-			// Fall back to single-tx to classify each error individually
-			results = make([]txResult, len(batch))
-			for i, msg := range batch {
-				br := p.broadcastSingleToEndpoints(ctx, rawTxs[i], msg.TXID)
-				results[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: msg.RawTx}
-			}
-		} else {
-			results = make([]txResult, len(batch))
-			for i, s := range batchStatuses {
-				results[i] = txResult{status: s, rawTxHex: batch[i].RawTx}
-			}
-		}
-	}
+	results := p.broadcastInChunks(ctx, batch, rawTxs)
 
 	// Step 3: Update status for each transaction, with retry classification
 	for i, res := range results {
@@ -289,6 +270,79 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 
 	p.logger.Info("batch propagated", zap.Int("count", len(batch)))
 	return nil
+}
+
+// broadcastInChunks splits a batch into teranodeBatchCap-sized chunks and
+// broadcasts each via /txs, falling back to per-tx /tx within a chunk only
+// when that chunk's batch broadcast is all-rejected. Returns per-tx results
+// in the same order as the input.
+func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationMsg, rawTxs [][]byte) []txResult {
+	results := make([]txResult, len(batch))
+	chunkSize := p.teranodeBatchCap
+	if chunkSize <= 0 {
+		chunkSize = len(batch)
+	}
+	for start := 0; start < len(batch); start += chunkSize {
+		end := start + chunkSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		p.broadcastChunk(ctx, batch[start:end], rawTxs[start:end], results[start:end])
+	}
+	return results
+}
+
+// broadcastChunk broadcasts a single chunk (≤ teranodeBatchCap). Single-tx
+// chunks go to /tx; multi-tx chunks try /txs first and fall back to per-tx
+// only on all-rejected. The per-tx fallback is logged as a single summary
+// line to avoid flooding the log with one entry per transaction.
+func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg, rawTxs [][]byte, out []txResult) {
+	if len(chunk) == 1 {
+		br := p.broadcastSingleToEndpoints(ctx, rawTxs[0], chunk[0].TXID)
+		out[0] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: chunk[0].RawTx}
+		return
+	}
+
+	batchStatuses := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk)
+	allRejected := len(batchStatuses) > 0
+	for _, s := range batchStatuses {
+		if s != nil && s.Status != models.StatusRejected {
+			allRejected = false
+			break
+		}
+	}
+	if !allRejected {
+		for i, s := range batchStatuses {
+			out[i] = txResult{status: s, rawTxHex: chunk[i].RawTx}
+		}
+		return
+	}
+
+	// Fallback: per-tx classification for this chunk only. Summarise instead
+	// of logging per call — one line per fallback, not N.
+	var accepted, rejected, retryable int
+	for i, msg := range chunk {
+		br := p.broadcastSingleToEndpoints(ctx, rawTxs[i], msg.TXID)
+		out[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: msg.RawTx}
+		switch {
+		case br.Status == nil:
+			// no verdict (202 or all timed out)
+		case br.Status.Status == models.StatusAcceptedByNetwork:
+			accepted++
+		case br.Status.Status == models.StatusRejected:
+			if IsRetryableError(br.ErrorMsg) {
+				retryable++
+			} else {
+				rejected++
+			}
+		}
+	}
+	p.logger.Info("per-tx fallback complete",
+		zap.Int("chunk_size", len(chunk)),
+		zap.Int("accepted", accepted),
+		zap.Int("rejected", rejected),
+		zap.Int("retryable", retryable),
+	)
 }
 
 // broadcastResult holds the outcome of a single-tx broadcast across all endpoints.
@@ -332,27 +386,20 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 		close(resultCh)
 	}()
 
-	// Find best status: 200→AcceptedByNetwork, 202→nil (no update), error→Rejected
+	// Find best status: 200→AcceptedByNetwork, 202→nil (no update), error→Rejected.
+	// Per-endpoint outcomes are not logged — in a per-tx fallback path that
+	// produces one DEBUG line per tx (N per chunk), drowning out useful signal.
+	// Aggregate summaries are emitted by the caller (broadcastChunk).
 	var bestStatus models.Status
 	var lastErrMsg string
 	for result := range resultCh {
 		if result.err != nil {
-			p.logger.Debug("single broadcast endpoint failed",
-				zap.String("txid", txid),
-				zap.String("endpoint", result.endpoint),
-				zap.Error(result.err),
-			)
 			lastErrMsg = result.err.Error()
 			if statusPriority(models.StatusRejected) > statusPriority(bestStatus) {
 				bestStatus = models.StatusRejected
 			}
 			continue
 		}
-		p.logger.Debug("single broadcast endpoint succeeded",
-			zap.String("txid", txid),
-			zap.String("endpoint", result.endpoint),
-			zap.Int("status_code", result.statusCode),
-		)
 		switch result.statusCode {
 		case http.StatusOK:
 			if statusPriority(models.StatusAcceptedByNetwork) > statusPriority(bestStatus) {

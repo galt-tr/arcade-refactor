@@ -564,6 +564,46 @@ func TestProcessBatch_100Transactions(t *testing.T) {
 	}
 }
 
+// Oversized batches are chunked to teranode_max_batch_size so a 1.5k Kafka
+// flush can't trigger "too many transactions" → per-tx storm on Teranode.
+func TestProcessBatch_ChunksOversizedBatch(t *testing.T) {
+	var batchBroadcastCount atomic.Int32
+	var batchSizes []int
+	var sizesMu sync.Mutex
+	teranodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		batchBroadcastCount.Add(1)
+		// Count transactions in the body as a cheap proxy for chunk size — we
+		// don't parse the binary payload, we just record the byte length.
+		// What we actually care about here is the *count* of POST calls.
+		sizesMu.Lock()
+		batchSizes = append(batchSizes, int(r.ContentLength))
+		sizesMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer teranodeSrv.Close()
+
+	ms := newMockStore()
+	cfg := &config.Config{}
+	cfg.Propagation.MerkleConcurrency = 10
+	cfg.Propagation.TeranodeMaxBatchSize = 10 // small cap so 25 txs → 3 chunks
+	tc := teranode.NewClient([]string{teranodeSrv.URL}, "")
+	p := New(cfg, zap.NewNop(), nil, ms, nil, tc, nil)
+
+	for i := 0; i < 25; i++ {
+		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%03d", i))))
+	}
+	if err := p.flushBatch(); err != nil {
+		t.Fatalf("flush error: %v", err)
+	}
+
+	if got := batchBroadcastCount.Load(); got != 3 {
+		t.Errorf("expected 25 txs / cap=10 → 3 /txs calls, got %d", got)
+	}
+	if ms.updateCount() != 25 {
+		t.Errorf("expected 25 status updates, got %d", ms.updateCount())
+	}
+}
+
 // Test 8: Merkle failure aborts entire batch — no broadcast
 func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 	var broadcastCount atomic.Int32

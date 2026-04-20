@@ -71,6 +71,11 @@ type PropagationConfig struct {
 	// renewal. Set to at least 2–3× reaper_interval_ms so a missed tick
 	// doesn't trigger a false-positive failover. Defaults to 3× interval.
 	LeaseTTLMs int `mapstructure:"lease_ttl_ms"`
+	// TeranodeMaxBatchSize caps the number of transactions per POST /txs call.
+	// Teranode rejects oversized batches with "too many transactions" (400),
+	// which previously cascaded into a 1k+ per-tx fallback storm. Splitting
+	// into chunks keeps the batch endpoint in play even under Kafka backlog.
+	TeranodeMaxBatchSize int `mapstructure:"teranode_max_batch_size"`
 }
 
 // BumpBuilderConfig controls the BUMP construction workflow. GraceWindowMs is the
@@ -145,6 +150,7 @@ func setDefaults() {
 	// 0 keeps New()'s 3×reaper_interval default, so changing reaper_interval
 	// automatically moves the lease TTL unless the operator opts into a fixed value.
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
+	viper.SetDefault("propagation.teranode_max_batch_size", 100)
 	viper.SetDefault("bump_builder.grace_window_ms", 30000)
 }
 
