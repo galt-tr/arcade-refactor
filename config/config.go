@@ -54,10 +54,13 @@ type Kafka struct {
 }
 
 type Aero struct {
-	Hosts     []string `mapstructure:"hosts"`
-	Namespace string   `mapstructure:"namespace"`
-	BatchSize int      `mapstructure:"batch_size"`
-	PoolSize  int      `mapstructure:"pool_size"`
+	Hosts           []string `mapstructure:"hosts"`
+	Namespace       string   `mapstructure:"namespace"`
+	BatchSize       int      `mapstructure:"batch_size"`
+	PoolSize        int      `mapstructure:"pool_size"`
+	QueryTimeoutMs  int      `mapstructure:"query_timeout_ms"`
+	OpTimeoutMs     int      `mapstructure:"op_timeout_ms"`
+	SocketTimeoutMs int      `mapstructure:"socket_timeout_ms"`
 }
 
 type TeranodeConfig struct {
@@ -157,6 +160,9 @@ func setDefaults() {
 	viper.SetDefault("aerospike.namespace", "arcade")
 	viper.SetDefault("aerospike.batch_size", 500)
 	viper.SetDefault("aerospike.pool_size", 256)
+	viper.SetDefault("aerospike.query_timeout_ms", 8000)
+	viper.SetDefault("aerospike.op_timeout_ms", 3000)
+	viper.SetDefault("aerospike.socket_timeout_ms", 5000)
 	viper.SetDefault("health.port", 8081)
 	viper.SetDefault("propagation.merkle_concurrency", 10)
 	viper.SetDefault("propagation.retry_max_attempts", 5)

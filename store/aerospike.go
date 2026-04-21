@@ -37,9 +37,12 @@ var _ Store = (*AerospikeStore)(nil)
 var _ Leaser = (*AerospikeStore)(nil)
 
 type AerospikeStore struct {
-	client    *aero.Client
-	namespace string
-	batchSize int
+	client         *aero.Client
+	namespace      string
+	batchSize      int
+	queryTimeout   time.Duration
+	opTimeout      time.Duration
+	socketTimeout  time.Duration
 }
 
 func NewAerospikeStore(cfg config.Aero) (*AerospikeStore, error) {
@@ -67,9 +70,12 @@ func NewAerospikeStore(cfg config.Aero) (*AerospikeStore, error) {
 	}
 
 	s := &AerospikeStore{
-		client:    client,
-		namespace: cfg.Namespace,
-		batchSize: cfg.BatchSize,
+		client:        client,
+		namespace:     cfg.Namespace,
+		batchSize:     cfg.BatchSize,
+		queryTimeout:  time.Duration(cfg.QueryTimeoutMs) * time.Millisecond,
+		opTimeout:     time.Duration(cfg.OpTimeoutMs) * time.Millisecond,
+		socketTimeout: time.Duration(cfg.SocketTimeoutMs) * time.Millisecond,
 	}
 
 	if err := s.EnsureIndexes(); err != nil {
@@ -116,16 +122,79 @@ func (s *AerospikeStore) key(set string, pk string) (*aero.Key, error) {
 	return aero.NewKey(s.namespace, set, pk)
 }
 
+// remaining returns the time budget for a single Aerospike operation under ctx.
+// If ctx is already done, returns 0 so the client fails fast without borrowing
+// a pool slot. If ctx has no deadline, falls back to the configured default.
+// Otherwise returns the shorter of (deadline-remaining, default).
+func remaining(ctx context.Context, def time.Duration) time.Duration {
+	if err := ctx.Err(); err != nil {
+		return 0
+	}
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return def
+	}
+	rem := time.Until(dl)
+	if rem <= 0 {
+		return 0
+	}
+	if def > 0 && rem > def {
+		return def
+	}
+	return rem
+}
+
+// queryPolicy builds a QueryPolicy whose TotalTimeout tracks ctx deadline,
+// capped by the configured query timeout. MaxRetries is kept low so a
+// failing query can't hog a connection across many server-side retries.
+func (s *AerospikeStore) queryPolicy(ctx context.Context) *aero.QueryPolicy {
+	p := aero.NewQueryPolicy()
+	p.TotalTimeout = remaining(ctx, s.queryTimeout)
+	p.SocketTimeout = s.socketTimeout
+	p.MaxRetries = 1
+	return p
+}
+
+// readPolicy builds a BasePolicy for single-record reads.
+func (s *AerospikeStore) readPolicy(ctx context.Context) *aero.BasePolicy {
+	p := aero.NewPolicy()
+	p.TotalTimeout = remaining(ctx, s.opTimeout)
+	p.SocketTimeout = s.socketTimeout
+	p.MaxRetries = 2
+	return p
+}
+
+// writePolicy builds a WritePolicy for single-record writes. Callers can
+// mutate RecordExistsAction, Expiration, GenerationPolicy, etc. on the
+// returned struct.
+func (s *AerospikeStore) writePolicy(ctx context.Context) *aero.WritePolicy {
+	p := aero.NewWritePolicy(0, 0)
+	p.TotalTimeout = remaining(ctx, s.opTimeout)
+	p.SocketTimeout = s.socketTimeout
+	p.MaxRetries = 2
+	return p
+}
+
+// batchPolicy builds a BatchPolicy for multi-record operations. Retries are
+// kept low because batch failures amplify connection pressure.
+func (s *AerospikeStore) batchPolicy(ctx context.Context) *aero.BatchPolicy {
+	p := aero.NewBatchPolicy()
+	p.TotalTimeout = remaining(ctx, s.opTimeout)
+	p.SocketTimeout = s.socketTimeout
+	p.MaxRetries = 1
+	return p
+}
+
 // --- Transaction Status Operations ---
 
-func (s *AerospikeStore) GetOrInsertStatus(_ context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+func (s *AerospikeStore) GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {
 		return nil, false, err
 	}
 
 	// Try to read existing
-	rec, err := s.client.Get(nil, key)
+	rec, err := s.client.Get(s.readPolicy(ctx), key)
 	if err != nil && !isKeyNotFound(err) {
 		return nil, false, fmt.Errorf("get status: %w", err)
 	}
@@ -151,11 +220,11 @@ func (s *AerospikeStore) GetOrInsertStatus(_ context.Context, status *models.Tra
 		"created_at": now.UnixMilli(),
 	}
 
-	policy := aero.NewWritePolicy(0, 0)
+	policy := s.writePolicy(ctx)
 	policy.RecordExistsAction = aero.CREATE_ONLY
 	if err := s.client.Put(policy, key, bins); err != nil {
 		// Race condition: someone else inserted — re-read
-		rec, getErr := s.client.Get(nil, key)
+		rec, getErr := s.client.Get(s.readPolicy(ctx), key)
 		if getErr != nil && !isKeyNotFound(getErr) {
 			return nil, false, fmt.Errorf("re-read after conflict: %w", getErr)
 		}
@@ -170,7 +239,7 @@ func (s *AerospikeStore) GetOrInsertStatus(_ context.Context, status *models.Tra
 	return status, true, nil
 }
 
-func (s *AerospikeStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
+func (s *AerospikeStore) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {
 		return err
@@ -193,7 +262,7 @@ func (s *AerospikeStore) UpdateStatus(_ context.Context, status *models.Transact
 		bins["merkle_path"] = []byte(status.MerklePath)
 	}
 
-	return s.client.Put(nil, key, bins)
+	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
 func (s *AerospikeStore) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
@@ -202,7 +271,7 @@ func (s *AerospikeStore) GetStatus(ctx context.Context, txid string) (*models.Tr
 		return nil, err
 	}
 
-	rec, err := s.client.Get(nil, key)
+	rec, err := s.client.Get(s.readPolicy(ctx), key)
 	if err != nil && !isKeyNotFound(err) {
 		return nil, fmt.Errorf("get status %s: %w", txid, err)
 	}
@@ -215,52 +284,97 @@ func (s *AerospikeStore) GetStatus(ctx context.Context, txid string) (*models.Tr
 	return status, nil
 }
 
-func (s *AerospikeStore) GetStatusesSince(_ context.Context, _ time.Time) ([]*models.TransactionStatus, error) {
+func (s *AerospikeStore) GetStatusesSince(ctx context.Context, _ time.Time) ([]*models.TransactionStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Scan all transactions — for TxTracker loading
 	stmt := aero.NewStatement(s.namespace, setTransactions)
-	rs, err := s.client.Query(nil, stmt)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer rs.Close()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("query statuses: %w", err)
 	}
-	defer rs.Close()
 
-	var results []*models.TransactionStatus
-	for rec := range rs.Results() {
-		if rec.Err != nil {
-			return nil, rec.Err
+	var (
+		results []*models.TransactionStatus
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				loopErr = rec.Err
+				break loop
+			}
+			txid := getString(rec.Record, "txid")
+			results = append(results, recordToStatus(rec.Record, txid))
 		}
-		txid := getString(rec.Record, "txid")
-		results = append(results, recordToStatus(rec.Record, txid))
+	}
+	if loopErr != nil {
+		return nil, loopErr
 	}
 	return results, nil
 }
 
-func (s *AerospikeStore) SetStatusByBlockHash(_ context.Context, blockHash string, newStatus models.Status) ([]string, error) {
+func (s *AerospikeStore) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	stmt := aero.NewStatement(s.namespace, setTransactions)
 	stmt.SetFilter(aero.NewEqualFilter("block_hash", blockHash))
 
-	rs, err := s.client.Query(nil, stmt)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer rs.Close()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("query by block hash: %w", err)
 	}
-	defer rs.Close()
 
-	var txids []string
-	for rec := range rs.Results() {
-		if rec.Err != nil {
-			continue
+	var (
+		txids   []string
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				continue
+			}
+			txid := getString(rec.Record, "txid")
+			if txid == "" {
+				continue
+			}
+			key, err := s.key(setTransactions, txid)
+			if err != nil {
+				continue
+			}
+			bins := aero.BinMap{"status": string(newStatus), "timestamp": time.Now().UnixMilli()}
+			if err := s.client.Put(s.writePolicy(ctx), key, bins); err != nil {
+				continue
+			}
+			txids = append(txids, txid)
 		}
-		txid := getString(rec.Record, "txid")
-		if txid == "" {
-			continue
-		}
-		key, err := s.key(setTransactions, txid)
-		if err != nil {
-			continue
-		}
-		bins := aero.BinMap{"status": string(newStatus), "timestamp": time.Now().UnixMilli()}
-		s.client.Put(nil, key, bins)
-		txids = append(txids, txid)
+	}
+	if loopErr != nil {
+		return txids, loopErr
 	}
 	return txids, nil
 }
@@ -269,12 +383,16 @@ func (s *AerospikeStore) SetStatusByBlockHash(_ context.Context, blockHash strin
 // Bin writes for status / raw_tx / next_retry_at are handled separately by
 // SetPendingRetryFields so callers can compute the correct backoff from the
 // post-increment count.
-func (s *AerospikeStore) BumpRetryCount(_ context.Context, txid string) (int, error) {
+func (s *AerospikeStore) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return 0, err
 	}
-	rec, err := s.client.Operate(nil, key, aero.AddOp(aero.NewBin("retry_count", 1)), aero.GetOp())
+	// AddOp is non-idempotent — set MaxRetries=0 so a timed-out attempt is not
+	// retried and double-counted.
+	wp := s.writePolicy(ctx)
+	wp.MaxRetries = 0
+	rec, err := s.client.Operate(wp, key, aero.AddOp(aero.NewBin("retry_count", 1)), aero.GetOp())
 	if err != nil {
 		return 0, fmt.Errorf("bump retry count %s: %w", txid, err)
 	}
@@ -289,7 +407,7 @@ func (s *AerospikeStore) BumpRetryCount(_ context.Context, txid string) (int, er
 // SetPendingRetryFields writes the durable retry bins in one atomic call. The
 // caller is responsible for having already bumped retry_count and computed
 // next_retry_at from that post-increment value.
-func (s *AerospikeStore) SetPendingRetryFields(_ context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *AerospikeStore) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return err
@@ -300,7 +418,7 @@ func (s *AerospikeStore) SetPendingRetryFields(_ context.Context, txid string, r
 		aero.PutOp(aero.NewBin("next_retry_at", nextRetryAt.UnixMilli())),
 		aero.PutOp(aero.NewBin("timestamp", time.Now().UnixMilli())),
 	}
-	if _, err := s.client.Operate(nil, key, ops...); err != nil {
+	if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
 		return fmt.Errorf("set pending retry fields %s: %w", txid, err)
 	}
 	return nil
@@ -309,43 +427,63 @@ func (s *AerospikeStore) SetPendingRetryFields(_ context.Context, txid string, r
 // GetReadyRetries uses the existing idx_tx_status index to find PENDING_RETRY
 // rows and filters by next_retry_at in code. At expected cardinality
 // (thousands, not millions) this is cheap.
-func (s *AerospikeStore) GetReadyRetries(_ context.Context, now time.Time, limit int) ([]*PendingRetry, error) {
+func (s *AerospikeStore) GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*PendingRetry, error) {
 	if limit <= 0 {
 		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	stmt := aero.NewStatement(s.namespace, setTransactions)
 	stmt.SetFilter(aero.NewEqualFilter("status", string(models.StatusPendingRetry)))
 
-	rs, err := s.client.Query(nil, stmt)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer rs.Close()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("query pending retry txs: %w", err)
 	}
-	defer rs.Close()
 
 	nowMs := now.UnixMilli()
 	results := make([]*PendingRetry, 0, limit)
-	for rec := range rs.Results() {
-		if rec.Err != nil {
-			return nil, rec.Err
+	var loopErr error
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				loopErr = rec.Err
+				break loop
+			}
+			nextMs := getInt64(rec.Record, "next_retry_at")
+			if nextMs > nowMs {
+				continue
+			}
+			rawTx, _ := rec.Record.Bins["raw_tx"].([]byte)
+			if len(rawTx) == 0 {
+				// Legacy PENDING_RETRY rows from before durable retries — skip.
+				continue
+			}
+			results = append(results, &PendingRetry{
+				TxID:        getString(rec.Record, "txid"),
+				RawTx:       rawTx,
+				RetryCount:  getInt(rec.Record, "retry_count"),
+				NextRetryAt: time.UnixMilli(nextMs),
+			})
+			if len(results) >= limit {
+				break loop
+			}
 		}
-		nextMs := getInt64(rec.Record, "next_retry_at")
-		if nextMs > nowMs {
-			continue
-		}
-		rawTx, _ := rec.Record.Bins["raw_tx"].([]byte)
-		if len(rawTx) == 0 {
-			// Legacy PENDING_RETRY rows from before durable retries — skip.
-			continue
-		}
-		results = append(results, &PendingRetry{
-			TxID:        getString(rec.Record, "txid"),
-			RawTx:       rawTx,
-			RetryCount:  getInt(rec.Record, "retry_count"),
-			NextRetryAt: time.UnixMilli(nextMs),
-		})
-		if len(results) >= limit {
-			break
-		}
+	}
+	if loopErr != nil {
+		return nil, loopErr
 	}
 	return results, nil
 }
@@ -353,7 +491,7 @@ func (s *AerospikeStore) GetReadyRetries(_ context.Context, now time.Time, limit
 // ClearRetryState transitions a tx out of PENDING_RETRY and deletes the retry
 // bins so the row stops matching the reaper's query. retry_count is retained
 // for observability.
-func (s *AerospikeStore) ClearRetryState(_ context.Context, txid string, finalStatus models.Status, extraInfo string) error {
+func (s *AerospikeStore) ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return err
@@ -368,13 +506,13 @@ func (s *AerospikeStore) ClearRetryState(_ context.Context, txid string, finalSt
 	if extraInfo != "" {
 		ops = append(ops, aero.PutOp(aero.NewBin("extra_info", extraInfo)))
 	}
-	if _, err := s.client.Operate(nil, key, ops...); err != nil {
+	if _, err := s.client.Operate(s.writePolicy(ctx), key, ops...); err != nil {
 		return fmt.Errorf("clear retry state %s: %w", txid, err)
 	}
 	return nil
 }
 
-func (s *AerospikeStore) SetMinedByTxIDs(_ context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
+func (s *AerospikeStore) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
 	now := time.Now()
 	var statuses []*models.TransactionStatus
 
@@ -382,6 +520,9 @@ func (s *AerospikeStore) SetMinedByTxIDs(_ context.Context, blockHash string, tx
 	bwp.RecordExistsAction = aero.UPDATE_ONLY
 
 	for i := 0; i < len(txids); i += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return statuses, err
+		}
 		end := i + s.batchSize
 		if end > len(txids) {
 			end = len(txids)
@@ -402,7 +543,9 @@ func (s *AerospikeStore) SetMinedByTxIDs(_ context.Context, blockHash string, tx
 			records[j] = aero.NewBatchWrite(bwp, key, ops...)
 		}
 
-		s.client.BatchOperate(nil, records)
+		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
+			return statuses, fmt.Errorf("batch set mined: %w", err)
+		}
 
 		for j, txid := range batch {
 			if records[j] != nil && records[j].BatchRec().Err == nil {
@@ -421,7 +564,7 @@ func (s *AerospikeStore) SetMinedByTxIDs(_ context.Context, blockHash string, tx
 
 // --- BUMP Operations ---
 
-func (s *AerospikeStore) InsertBUMP(_ context.Context, blockHash string, blockHeight uint64, bumpData []byte) error {
+func (s *AerospikeStore) InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error {
 	key, err := s.key(setBumps, blockHash)
 	if err != nil {
 		return err
@@ -431,15 +574,15 @@ func (s *AerospikeStore) InsertBUMP(_ context.Context, blockHash string, blockHe
 		"block_height": int(blockHeight),
 		"bump_data":    bumpData,
 	}
-	return s.client.Put(nil, key, bins)
+	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
-func (s *AerospikeStore) GetBUMP(_ context.Context, blockHash string) (uint64, []byte, error) {
+func (s *AerospikeStore) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, error) {
 	key, err := s.key(setBumps, blockHash)
 	if err != nil {
 		return 0, nil, err
 	}
-	rec, err := s.client.Get(nil, key)
+	rec, err := s.client.Get(s.readPolicy(ctx), key)
 	if err != nil && !isKeyNotFound(err) {
 		return 0, nil, fmt.Errorf("get bump %s: %w", blockHash, err)
 	}
@@ -464,7 +607,7 @@ func (s *AerospikeStore) GetBUMP(_ context.Context, blockHash string) (uint64, [
 
 // --- STUMP Operations (keyed by blockHash:subtreeIndex) ---
 
-func (s *AerospikeStore) InsertStump(_ context.Context, stump *models.Stump) error {
+func (s *AerospikeStore) InsertStump(ctx context.Context, stump *models.Stump) error {
 	pk := fmt.Sprintf("%s:%d", stump.BlockHash, stump.SubtreeIndex)
 	key, err := s.key(setStumps, pk)
 	if err != nil {
@@ -475,49 +618,74 @@ func (s *AerospikeStore) InsertStump(_ context.Context, stump *models.Stump) err
 		"subtree_index": stump.SubtreeIndex,
 		"stump_data":    stump.StumpData,
 	}
-	return s.client.Put(nil, key, bins)
+	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
-func (s *AerospikeStore) GetStumpsByBlockHash(_ context.Context, blockHash string) ([]*models.Stump, error) {
+func (s *AerospikeStore) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	stmt := aero.NewStatement(s.namespace, setStumps)
 	stmt.SetFilter(aero.NewEqualFilter("block_hash", blockHash))
 
-	rs, err := s.client.Query(nil, stmt)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer rs.Close()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("query stumps: %w", err)
 	}
-	defer rs.Close()
 
-	var stumps []*models.Stump
-	for rec := range rs.Results() {
-		if rec.Err != nil {
-			return nil, rec.Err
-		}
-		stump := &models.Stump{
-			BlockHash: getString(rec.Record, "block_hash"),
-		}
-		if v, ok := rec.Record.Bins["subtree_index"]; ok {
-			if n, ok := v.(int); ok {
-				stump.SubtreeIndex = n
+	var (
+		stumps  []*models.Stump
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
 			}
-		}
-		if v, ok := rec.Record.Bins["stump_data"]; ok {
-			if b, ok := v.([]byte); ok {
-				stump.StumpData = b
+			if rec.Err != nil {
+				loopErr = rec.Err
+				break loop
 			}
+			stump := &models.Stump{
+				BlockHash: getString(rec.Record, "block_hash"),
+			}
+			if v, ok := rec.Record.Bins["subtree_index"]; ok {
+				if n, ok := v.(int); ok {
+					stump.SubtreeIndex = n
+				}
+			}
+			if v, ok := rec.Record.Bins["stump_data"]; ok {
+				if b, ok := v.([]byte); ok {
+					stump.StumpData = b
+				}
+			}
+			stumps = append(stumps, stump)
 		}
-		stumps = append(stumps, stump)
+	}
+	if loopErr != nil {
+		return nil, loopErr
 	}
 	return stumps, nil
 }
 
-func (s *AerospikeStore) DeleteStumpsByBlockHash(_ context.Context, blockHash string) error {
-	stumps, err := s.GetStumpsByBlockHash(context.Background(), blockHash)
+func (s *AerospikeStore) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error {
+	stumps, err := s.GetStumpsByBlockHash(ctx, blockHash)
 	if err != nil {
 		return err
 	}
 
 	for i := 0; i < len(stumps); i += s.batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		end := i + s.batchSize
 		if end > len(stumps) {
 			end = len(stumps)
@@ -534,14 +702,16 @@ func (s *AerospikeStore) DeleteStumpsByBlockHash(_ context.Context, blockHash st
 		for j, key := range keys {
 			records[j] = aero.NewBatchDelete(nil, key)
 		}
-		s.client.BatchOperate(nil, records)
+		if err := s.client.BatchOperate(s.batchPolicy(ctx), records); err != nil {
+			return fmt.Errorf("batch delete stumps: %w", err)
+		}
 	}
 	return nil
 }
 
 // --- Submission Operations ---
 
-func (s *AerospikeStore) InsertSubmission(_ context.Context, sub *models.Submission) error {
+func (s *AerospikeStore) InsertSubmission(ctx context.Context, sub *models.Submission) error {
 	key, err := s.key(setSubmissions, sub.SubmissionID)
 	if err != nil {
 		return err
@@ -554,50 +724,92 @@ func (s *AerospikeStore) InsertSubmission(_ context.Context, sub *models.Submiss
 		"full_status_updates": sub.FullStatusUpdates,
 		"created_at":          sub.CreatedAt.UnixMilli(),
 	}
-	return s.client.Put(nil, key, bins)
+	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
-func (s *AerospikeStore) GetSubmissionsByTxID(_ context.Context, txid string) ([]*models.Submission, error) {
+func (s *AerospikeStore) GetSubmissionsByTxID(ctx context.Context, txid string) ([]*models.Submission, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	stmt := aero.NewStatement(s.namespace, setSubmissions)
 	stmt.SetFilter(aero.NewEqualFilter("txid", txid))
 
-	rs, err := s.client.Query(nil, stmt)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer rs.Close()
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer rs.Close()
 
-	var subs []*models.Submission
-	for rec := range rs.Results() {
-		if rec.Err != nil {
-			continue
+	var (
+		subs    []*models.Submission
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				continue
+			}
+			subs = append(subs, recordToSubmission(rec.Record))
 		}
-		subs = append(subs, recordToSubmission(rec.Record))
+	}
+	if loopErr != nil {
+		return nil, loopErr
 	}
 	return subs, nil
 }
 
-func (s *AerospikeStore) GetSubmissionsByToken(_ context.Context, token string) ([]*models.Submission, error) {
+func (s *AerospikeStore) GetSubmissionsByToken(ctx context.Context, token string) ([]*models.Submission, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	stmt := aero.NewStatement(s.namespace, setSubmissions)
 	stmt.SetFilter(aero.NewEqualFilter("callback_token", token))
 
-	rs, err := s.client.Query(nil, stmt)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer rs.Close()
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer rs.Close()
 
-	var subs []*models.Submission
-	for rec := range rs.Results() {
-		if rec.Err != nil {
-			continue
+	var (
+		subs    []*models.Submission
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				continue
+			}
+			subs = append(subs, recordToSubmission(rec.Record))
 		}
-		subs = append(subs, recordToSubmission(rec.Record))
+	}
+	if loopErr != nil {
+		return nil, loopErr
 	}
 	return subs, nil
 }
 
-func (s *AerospikeStore) UpdateDeliveryStatus(_ context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
+func (s *AerospikeStore) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
 	key, err := s.key(setSubmissions, submissionID)
 	if err != nil {
 		return err
@@ -609,56 +821,104 @@ func (s *AerospikeStore) UpdateDeliveryStatus(_ context.Context, submissionID st
 	if nextRetry != nil {
 		bins["next_retry_at"] = nextRetry.UnixMilli()
 	}
-	return s.client.Put(nil, key, bins)
+	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
 // --- Block Tracking Operations ---
 
-func (s *AerospikeStore) HasAnyProcessedBlocks(_ context.Context) (bool, error) {
+func (s *AerospikeStore) HasAnyProcessedBlocks(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	stmt := aero.NewStatement(s.namespace, setProcessedBlocks)
-	rs, err := s.client.Query(nil, stmt)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer rs.Close()
+	}
 	if err != nil {
 		return false, err
 	}
-	defer rs.Close()
 
-	for rec := range rs.Results() {
-		if rec.Err == nil {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (s *AerospikeStore) GetOnChainBlockAtHeight(_ context.Context, height uint64) (string, bool, error) {
-	stmt := aero.NewStatement(s.namespace, setProcessedBlocks)
-	stmt.SetFilter(aero.NewEqualFilter("block_height", int(height)))
-
-	rs, err := s.client.Query(nil, stmt)
-	if err != nil {
-		return "", false, err
-	}
-	defer rs.Close()
-
-	for rec := range rs.Results() {
-		if rec.Err != nil {
-			continue
-		}
-		if v, ok := rec.Record.Bins["on_chain"]; ok {
-			if n, ok := v.(int); ok && n == 1 {
-				return getString(rec.Record, "block_hash"), true, nil
+	var (
+		found   bool
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err == nil {
+				found = true
+				break loop
 			}
 		}
 	}
-	return "", false, nil
+	if loopErr != nil {
+		return false, loopErr
+	}
+	return found, nil
 }
 
-func (s *AerospikeStore) MarkBlockOffChain(_ context.Context, blockHash string) error {
+func (s *AerospikeStore) GetOnChainBlockAtHeight(ctx context.Context, height uint64) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	stmt := aero.NewStatement(s.namespace, setProcessedBlocks)
+	stmt.SetFilter(aero.NewEqualFilter("block_height", int(height)))
+
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer rs.Close()
+	}
+	if err != nil {
+		return "", false, err
+	}
+
+	var (
+		blockHash string
+		onChain   bool
+		loopErr   error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				continue
+			}
+			if v, ok := rec.Record.Bins["on_chain"]; ok {
+				if n, ok := v.(int); ok && n == 1 {
+					blockHash = getString(rec.Record, "block_hash")
+					onChain = true
+					break loop
+				}
+			}
+		}
+	}
+	if loopErr != nil {
+		return "", false, loopErr
+	}
+	return blockHash, onChain, nil
+}
+
+func (s *AerospikeStore) MarkBlockOffChain(ctx context.Context, blockHash string) error {
 	key, err := s.key(setProcessedBlocks, blockHash)
 	if err != nil {
 		return err
 	}
-	return s.client.Put(nil, key, aero.BinMap{"on_chain": 0})
+	return s.client.Put(s.writePolicy(ctx), key, aero.BinMap{"on_chain": 0})
 }
 
 // --- Helpers ---
@@ -826,7 +1086,7 @@ func recordToSubmission(rec *aero.Record) *models.Submission {
 // native TTL as the authoritative expiration (no client clock dependency). The
 // expires_at bin is a belt-and-braces hint for the narrow window between TTL
 // lapse and next client scan.
-func (s *AerospikeStore) TryAcquireOrRenew(_ context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
+func (s *AerospikeStore) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
 	key, err := s.key(setLeases, name)
 	if err != nil {
 		return time.Time{}, err
@@ -834,7 +1094,7 @@ func (s *AerospikeStore) TryAcquireOrRenew(_ context.Context, name, holder strin
 	now := time.Now()
 	expiresAt := now.Add(ttl)
 
-	rec, err := s.client.Get(nil, key)
+	rec, err := s.client.Get(s.readPolicy(ctx), key)
 	if err != nil && !isKeyNotFound(err) {
 		return time.Time{}, fmt.Errorf("read lease %s: %w", name, err)
 	}
@@ -843,12 +1103,14 @@ func (s *AerospikeStore) TryAcquireOrRenew(_ context.Context, name, holder strin
 		"holder":     holder,
 		"expires_at": expiresAt.UnixMilli(),
 	}
+	ttlSecs := uint32(ttl.Seconds())
 
 	if rec == nil {
 		// No lease record yet — try to create it. CREATE_ONLY fails if a
 		// concurrent writer creates the row between our Get and Put; treat
 		// that as a benign contention signal.
-		policy := aero.NewWritePolicy(0, uint32(ttl.Seconds()))
+		policy := s.writePolicy(ctx)
+		policy.Expiration = ttlSecs
 		policy.RecordExistsAction = aero.CREATE_ONLY
 		if err := s.client.Put(policy, key, bins); err != nil {
 			return time.Time{}, nil
@@ -865,7 +1127,8 @@ func (s *AerospikeStore) TryAcquireOrRenew(_ context.Context, name, holder strin
 
 	// CAS-write: succeeds only if the record hasn't changed since our read.
 	// A gen mismatch means another pod won the race; not an error.
-	policy := aero.NewWritePolicy(0, uint32(ttl.Seconds()))
+	policy := s.writePolicy(ctx)
+	policy.Expiration = ttlSecs
 	policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
 	policy.Generation = rec.Generation
 	if err := s.client.Put(policy, key, bins); err != nil {
@@ -877,12 +1140,12 @@ func (s *AerospikeStore) TryAcquireOrRenew(_ context.Context, name, holder strin
 // Release deletes a lease record if it's still held by this caller. Gen-match
 // prevents us from stepping on a successor who has already acquired it after
 // our TTL lapsed. Swallows benign races (not held / raced to delete) as nil.
-func (s *AerospikeStore) Release(_ context.Context, name, holder string) error {
+func (s *AerospikeStore) Release(ctx context.Context, name, holder string) error {
 	key, err := s.key(setLeases, name)
 	if err != nil {
 		return err
 	}
-	rec, err := s.client.Get(nil, key)
+	rec, err := s.client.Get(s.readPolicy(ctx), key)
 	if err != nil {
 		if isKeyNotFound(err) {
 			return nil
@@ -892,7 +1155,7 @@ func (s *AerospikeStore) Release(_ context.Context, name, holder string) error {
 	if getString(rec, "holder") != holder {
 		return nil
 	}
-	policy := aero.NewWritePolicy(0, 0)
+	policy := s.writePolicy(ctx)
 	policy.GenerationPolicy = aero.EXPECT_GEN_EQUAL
 	policy.Generation = rec.Generation
 	if _, err := s.client.Delete(policy, key); err != nil {
