@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,8 +56,16 @@ func (m *mockSyncProducer) AddMessageToTxn(*sarama.ConsumerMessage, string, *str
 func (m *mockSyncProducer) TxnStatus() sarama.ProducerTxnStatusFlag { return 0 }
 
 // mockStore implements store.Store for testing callback handlers.
+//
+// InsertStump records calls under a composite "blockHash:subtreeIndex" key so
+// tests can verify the full round-trip of a STUMP payload (including hex
+// decoding of models.HexBytes). A mutex protects the stumps map because the
+// end-to-end STUMP test fires deliveries concurrently to mirror
+// merkle-service's 64-worker delivery pool.
 type mockStore struct {
+	mu                sync.Mutex
 	updateStatusCalls []*models.TransactionStatus
+	stumps            map[string]*models.Stump
 	insertStumpErr    error
 }
 
@@ -91,7 +101,24 @@ func (m *mockStore) GetSubmissionsByToken(context.Context, string) ([]*models.Su
 func (m *mockStore) UpdateDeliveryStatus(context.Context, string, models.Status, int, *time.Time) error {
 	return nil
 }
-func (m *mockStore) InsertStump(context.Context, *models.Stump) error        { return m.insertStumpErr }
+func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
+	if m.insertStumpErr != nil {
+		return m.insertStumpErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stumps == nil {
+		m.stumps = make(map[string]*models.Stump)
+	}
+	// Copy the payload so later caller mutation can't race with assertions.
+	dataCopy := append([]byte(nil), stump.StumpData...)
+	m.stumps[fmt.Sprintf("%s:%d", stump.BlockHash, stump.SubtreeIndex)] = &models.Stump{
+		BlockHash:    stump.BlockHash,
+		SubtreeIndex: stump.SubtreeIndex,
+		StumpData:    dataCopy,
+	}
+	return nil
+}
 func (m *mockStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stump, error) {
 	return nil, nil
 }
@@ -342,5 +369,201 @@ func TestHandleCallback_SeenMultipleNodes_EmptyTxIDs(t *testing.T) {
 
 	if len(ms.updateStatusCalls) != 0 {
 		t.Errorf("expected 0 UpdateStatus calls, got %d", len(ms.updateStatusCalls))
+	}
+}
+
+// TestHandleCallback_FullBlockFlow_20Subtrees simulates the production delivery
+// pattern that merkle-service executes for a 20,000-tx block split across 20
+// subtrees:
+//
+//  1. Twenty STUMP callbacks (one per subtreeIndex 0..19) POSTed to
+//     /api/v1/merkle-service/callback, each carrying a realistic ~8 KB payload
+//     hex-encoded via models.HexBytes. merkle-service fires these in parallel
+//     from a 64-worker delivery pool (merkle-service/internal/callback/delivery.go),
+//     so we dispatch them concurrently here.
+//  2. A single BLOCK_PROCESSED callback with just the block hash, which
+//     merkle-service's stumpGate only releases AFTER every STUMP has returned
+//     2xx (merkle-service/internal/callback/delivery.go stumpGate.Wait).
+//
+// The test asserts end-to-end correctness of the code path that production is
+// returning 500s from:
+//
+//   - every STUMP returns 200
+//   - all 20 STUMPs land in the store with the correct composite key and
+//     byte-identical payload (hex round-trip through models.HexBytes)
+//   - Kafka is not touched for STUMPs (they go to the store only)
+//   - BLOCK_PROCESSED produces exactly one Kafka message on
+//     arcade.block_processed, keyed by block hash, with the full
+//     CallbackMessage JSON as the value
+//   - retry semantics: a duplicated STUMP delivery still returns 200 and
+//     overwrites cleanly, because merkle-service retries on any non-2xx
+func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
+	const (
+		numSubtrees = 20
+		stumpSize   = 8 * 1024 // ~8 KB — realistic for a subtree covering ~1000 txs (BRC-0074 BUMP format)
+	)
+	blockHash := "000000000000000000001234567890abcdef1234567890abcdef1234567890ab"
+
+	// Deterministic per-subtree payload so byte-level assertions are stable.
+	stumpPayloads := make([][]byte, numSubtrees)
+	for i := range stumpPayloads {
+		buf := make([]byte, stumpSize)
+		for j := range buf {
+			buf[j] = byte((i*31 + j) & 0xFF)
+		}
+		stumpPayloads[i] = buf
+	}
+
+	mock := &mockSyncProducer{}
+	ms := &mockStore{}
+	_, router := setupServerWithStore(mock, ms)
+
+	// Phase 1: fire all 20 STUMPs in parallel.
+	var wg sync.WaitGroup
+	errCh := make(chan error, numSubtrees)
+	for i := 0; i < numSubtrees; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			payload := models.CallbackMessage{
+				Type:         models.CallbackStump,
+				BlockHash:    blockHash,
+				SubtreeIndex: i,
+				Stump:        stumpPayloads[i],
+			}
+			body, err := json.Marshal(payload)
+			if err != nil {
+				errCh <- fmt.Errorf("marshal subtree %d: %w", i, err)
+				return
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			// Match merkle-service's delivery headers exactly.
+			req.Header.Set("X-Idempotency-Key", fmt.Sprintf("%s:%d:STUMP", blockHash, i))
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				errCh <- fmt.Errorf("STUMP subtree %d: expected 200, got %d: %s", i, w.Code, w.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	// All 20 STUMPs must be in the store, bit-identical to what was sent.
+	ms.mu.Lock()
+	stored := len(ms.stumps)
+	ms.mu.Unlock()
+	if stored != numSubtrees {
+		t.Fatalf("expected %d STUMPs stored, got %d", numSubtrees, stored)
+	}
+	for i := 0; i < numSubtrees; i++ {
+		key := fmt.Sprintf("%s:%d", blockHash, i)
+		ms.mu.Lock()
+		stump, ok := ms.stumps[key]
+		ms.mu.Unlock()
+		if !ok {
+			t.Errorf("missing stump for subtree %d (key=%q)", i, key)
+			continue
+		}
+		if stump.BlockHash != blockHash {
+			t.Errorf("subtree %d: blockHash = %q, want %q", i, stump.BlockHash, blockHash)
+		}
+		if stump.SubtreeIndex != i {
+			t.Errorf("subtree %d: SubtreeIndex = %d, want %d", i, stump.SubtreeIndex, i)
+		}
+		if !bytes.Equal(stump.StumpData, stumpPayloads[i]) {
+			t.Errorf("subtree %d: stump bytes differ after hex round-trip (got %d bytes, want %d)",
+				i, len(stump.StumpData), len(stumpPayloads[i]))
+		}
+	}
+
+	// STUMPs must not produce Kafka traffic — the bump_builder consumes
+	// arcade.block_processed only, and STUMPs are writes to the store.
+	if len(mock.messages) != 0 {
+		t.Fatalf("expected 0 Kafka messages after STUMP phase, got %d", len(mock.messages))
+	}
+
+	// Phase 2: BLOCK_PROCESSED. Carries only the block hash; merkle-service
+	// does not resend the stump bytes here.
+	blockMsg := models.CallbackMessage{
+		Type:      models.CallbackBlockProcessed,
+		BlockHash: blockHash,
+	}
+	body, err := json.Marshal(blockMsg)
+	if err != nil {
+		t.Fatalf("marshal BLOCK_PROCESSED: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Idempotency-Key", blockHash+":BLOCK_PROCESSED")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("BLOCK_PROCESSED: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Exactly one Kafka message on arcade.block_processed, keyed by block
+	// hash, with the full CallbackMessage JSON as the value — this is what
+	// the bump_builder consumer expects (services/bump_builder/builder.go).
+	if len(mock.messages) != 1 {
+		t.Fatalf("expected 1 Kafka message after BLOCK_PROCESSED, got %d", len(mock.messages))
+	}
+	kmsg := mock.messages[0]
+	if kmsg.Topic != kafka.TopicBlockProcessed {
+		t.Errorf("Kafka topic = %q, want %q", kmsg.Topic, kafka.TopicBlockProcessed)
+	}
+	gotKey, err := kmsg.Key.Encode()
+	if err != nil {
+		t.Fatalf("encode kafka key: %v", err)
+	}
+	if string(gotKey) != blockHash {
+		t.Errorf("Kafka key = %q, want %q", gotKey, blockHash)
+	}
+	val, err := kmsg.Value.Encode()
+	if err != nil {
+		t.Fatalf("encode kafka value: %v", err)
+	}
+	var decoded models.CallbackMessage
+	if err := json.Unmarshal(val, &decoded); err != nil {
+		t.Fatalf("unmarshal kafka value: %v", err)
+	}
+	if decoded.Type != models.CallbackBlockProcessed {
+		t.Errorf("kafka value Type = %q, want %q", decoded.Type, models.CallbackBlockProcessed)
+	}
+	if decoded.BlockHash != blockHash {
+		t.Errorf("kafka value BlockHash = %q, want %q", decoded.BlockHash, blockHash)
+	}
+
+	// Phase 3: idempotency. merkle-service retries on any non-2xx with
+	// linear backoff, so a second delivery of subtree 0 must still return
+	// 200. Our store is upsert-on-(blockHash,subtreeIndex) so the count
+	// stays at 20.
+	retryPayload := models.CallbackMessage{
+		Type:         models.CallbackStump,
+		BlockHash:    blockHash,
+		SubtreeIndex: 0,
+		Stump:        stumpPayloads[0],
+	}
+	retryBody, _ := json.Marshal(retryPayload)
+	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(retryBody))
+	retryReq.Header.Set("Content-Type", "application/json")
+	retryW := httptest.NewRecorder()
+	router.ServeHTTP(retryW, retryReq)
+	if retryW.Code != http.StatusOK {
+		t.Fatalf("duplicate STUMP: expected 200, got %d: %s", retryW.Code, retryW.Body.String())
+	}
+	ms.mu.Lock()
+	finalCount := len(ms.stumps)
+	ms.mu.Unlock()
+	if finalCount != numSubtrees {
+		t.Errorf("expected stump count to stay at %d after duplicate, got %d", numSubtrees, finalCount)
 	}
 }
