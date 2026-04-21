@@ -67,6 +67,10 @@ type mockStore struct {
 	updateStatusCalls []*models.TransactionStatus
 	stumps            map[string]*models.Stump
 	insertStumpErr    error
+	// insertStumpFn, if set, runs before the default record step and may
+	// return an error to simulate per-key failures (Aerospike RECORD_TOO_BIG,
+	// DEVICE_OVERLOAD, HOT_KEY, etc.). Returning non-nil skips the record.
+	insertStumpFn func(stump *models.Stump) error
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
@@ -104,6 +108,11 @@ func (m *mockStore) UpdateDeliveryStatus(context.Context, string, models.Status,
 func (m *mockStore) InsertStump(_ context.Context, stump *models.Stump) error {
 	if m.insertStumpErr != nil {
 		return m.insertStumpErr
+	}
+	if m.insertStumpFn != nil {
+		if err := m.insertStumpFn(stump); err != nil {
+			return err
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -565,5 +574,137 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 	ms.mu.Unlock()
 	if finalCount != numSubtrees {
 		t.Errorf("expected stump count to stay at %d after duplicate, got %d", numSubtrees, finalCount)
+	}
+}
+
+// TestHandleCallback_FullBlockFlow_PartialStumpFailure reproduces the
+// production failure surface: during delivery of 20 STUMPs, one subtree's
+// Put() fails at the store layer (simulating Aerospike's RECORD_TOO_BIG when
+// a busy subtree's BUMP proof exceeds the namespace's write-block-size, or a
+// transient DEVICE_OVERLOAD / HOT_KEY on a single composite key) while the
+// other 19 succeed.
+//
+// The test locks down the observable behaviour that the bump_builder and
+// merkle-service both depend on:
+//
+//   - the failing STUMP responds 500 so merkle-service's retry loop
+//     re-queues it (merkle-service/internal/callback/delivery.go dispatch →
+//     retry path)
+//   - the succeeding STUMPs respond 200 and land in the store
+//   - NO BLOCK_PROCESSED-like Kafka publish happens during the STUMP phase,
+//     so bump_builder never sees a block with missing STUMPs
+//   - sending BLOCK_PROCESSED while one STUMP is still missing DOES still
+//     publish to Kafka — arcade does not validate STUMP completeness here.
+//     That is intentional: merkle-service's stumpGate is what gates
+//     BLOCK_PROCESSED on upstream 2xx, and if the retry exhausts it falls
+//     into merkle-service's DLQ rather than calling BLOCK_PROCESSED.
+//     This assertion documents where responsibility sits.
+func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
+	const (
+		numSubtrees   = 20
+		stumpSize     = 8 * 1024
+		failingSubtree = 7
+	)
+	blockHash := "000000000000000000001234567890abcdef1234567890abcdef1234567890ab"
+
+	stumpPayloads := make([][]byte, numSubtrees)
+	for i := range stumpPayloads {
+		buf := make([]byte, stumpSize)
+		for j := range buf {
+			buf[j] = byte((i*31 + j) & 0xFF)
+		}
+		stumpPayloads[i] = buf
+	}
+
+	mock := &mockSyncProducer{}
+	ms := &mockStore{
+		insertStumpFn: func(stump *models.Stump) error {
+			if stump.SubtreeIndex == failingSubtree {
+				// Shape matches an Aerospike-style error string so a log
+				// consumer correlating with store-layer errors can find it.
+				return errors.New("Put failed: ResultCode: SERVER_MEM_ERROR")
+			}
+			return nil
+		},
+	}
+	_, router := setupServerWithStore(mock, ms)
+
+	type result struct {
+		idx    int
+		status int
+	}
+	resCh := make(chan result, numSubtrees)
+
+	var wg sync.WaitGroup
+	for i := 0; i < numSubtrees; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			payload := models.CallbackMessage{
+				Type:         models.CallbackStump,
+				BlockHash:    blockHash,
+				SubtreeIndex: i,
+				Stump:        stumpPayloads[i],
+			}
+			body, _ := json.Marshal(payload)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			resCh <- result{idx: i, status: w.Code}
+		}()
+	}
+	wg.Wait()
+	close(resCh)
+
+	statuses := make(map[int]int, numSubtrees)
+	for r := range resCh {
+		statuses[r.idx] = r.status
+	}
+	for i := 0; i < numSubtrees; i++ {
+		want := http.StatusOK
+		if i == failingSubtree {
+			want = http.StatusInternalServerError
+		}
+		if statuses[i] != want {
+			t.Errorf("subtree %d: status = %d, want %d", i, statuses[i], want)
+		}
+	}
+
+	ms.mu.Lock()
+	stored := len(ms.stumps)
+	_, failingStored := ms.stumps[fmt.Sprintf("%s:%d", blockHash, failingSubtree)]
+	ms.mu.Unlock()
+	if stored != numSubtrees-1 {
+		t.Errorf("expected %d STUMPs in store after partial failure, got %d", numSubtrees-1, stored)
+	}
+	if failingStored {
+		t.Errorf("failing subtree %d must not be in the store", failingSubtree)
+	}
+
+	// Kafka must be untouched during STUMP phase, even with a mid-flight 500.
+	if len(mock.messages) != 0 {
+		t.Fatalf("expected 0 Kafka messages during STUMP phase, got %d", len(mock.messages))
+	}
+
+	// BLOCK_PROCESSED is still accepted and published. arcade does not check
+	// STUMP completeness — that contract lives in merkle-service's stumpGate.
+	// The bump_builder handles missing STUMPs downstream via its grace window
+	// + GetStumpsByBlockHash retrieval, so this call must not be rejected.
+	blockMsg := models.CallbackMessage{
+		Type:      models.CallbackBlockProcessed,
+		BlockHash: blockHash,
+	}
+	body, _ := json.Marshal(blockMsg)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/merkle-service/callback", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("BLOCK_PROCESSED: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(mock.messages) != 1 {
+		t.Errorf("expected 1 Kafka message after BLOCK_PROCESSED, got %d", len(mock.messages))
 	}
 }

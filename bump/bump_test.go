@@ -1202,3 +1202,302 @@ func TestExtractMinimalPathForTx_InvalidInput(t *testing.T) {
 		t.Fatal("expected nil for nil BUMP data")
 	}
 }
+
+// --- Non-power-of-2 subtree count regression tests ---
+//
+// These reproduce a production failure where a block with 39 subtrees produced
+// "we do not have a hash for this index at height: 11" during ComputeRoot.
+// Root cause: bump.assembleFullPath populated the subtree-root layer with the
+// real N hashes but emitted no duplicate-padding entries for the odd slots
+// that Bitcoin's canonical merkle-root algorithm requires above the subtree
+// layer, so the climb hit a hole at the first odd level. Every prior
+// multi-subtree test used power-of-2 counts (2/4/8/16) so this was untested.
+
+// TestAssembleBUMP_NonPow2SubtreeCounts exercises AssembleBUMP for every
+// non-power-of-2 subtree count we're likely to see in production. For each,
+// it assembles the BUMP for a tracked tx in every subtree and climbs the
+// tree back to the root — the computed root must equal the canonical
+// Bitcoin merkle root of the subtree roots.
+func TestAssembleBUMP_NonPow2SubtreeCounts(t *testing.T) {
+	cases := []struct {
+		name        string
+		numSubtrees int
+		subtreeSize int
+	}{
+		{"3subtrees_4txs", 3, 4},
+		{"5subtrees_4txs", 5, 4},
+		{"7subtrees_4txs", 7, 4},
+		{"17subtrees_8txs", 17, 8},
+		{"33subtrees_8txs", 33, 8},
+		{"39subtrees_8txs_productionShape", 39, 8},
+		{"63subtrees_4txs", 63, 4},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(tc.numSubtrees, tc.subtreeSize)
+
+			// For every subtree, pick a txid and assemble its BUMP. Every one
+			// must climb to blockRoot — the climb path varies across subtrees
+			// so the duplicate-padding slots must be correct at every level.
+			for s := 0; s < tc.numSubtrees; s++ {
+				txOffset := uint64(s % tc.subtreeSize)
+				stump := buildSTUMP(allLeaves[s], txOffset, 900000)
+				result, _, err := AssembleBUMP(stump, s, subtreeHashes, nil)
+				if err != nil {
+					t.Fatalf("subtree %d: AssembleBUMP failed: %v", s, err)
+				}
+				root, err := result.ComputeRoot(&allLeaves[s][txOffset])
+				if err != nil {
+					t.Fatalf("subtree %d: ComputeRoot failed: %v", s, err)
+				}
+				if *root != blockRoot {
+					t.Fatalf("subtree %d: root mismatch: got %s want %s", s, root, blockRoot)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildCompoundBUMP_NonPow2SubtreeCounts builds the compound BUMP for a
+// block with non-pow2 subtree count, then validates every txid at level 0
+// climbs to the canonical block root. This reproduces the production failure
+// end-to-end: BuildCompoundBUMP → ValidateCompoundRoot → per-tx ComputeRoot.
+func TestBuildCompoundBUMP_NonPow2SubtreeCounts(t *testing.T) {
+	cases := []struct {
+		name        string
+		numSubtrees int
+		subtreeSize int
+	}{
+		{"3subtrees_4txs", 3, 4},
+		{"5subtrees_4txs", 5, 4},
+		{"7subtrees_8txs", 7, 8},
+		{"17subtrees_8txs", 17, 8},
+		{"33subtrees_4txs", 33, 4},
+		{"39subtrees_8txs_productionShape", 39, 8},
+		{"63subtrees_4txs", 63, 4},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(tc.numSubtrees, tc.subtreeSize)
+
+			stumps := make([]*models.Stump, tc.numSubtrees)
+			for s := 0; s < tc.numSubtrees; s++ {
+				stumps[s] = &models.Stump{
+					BlockHash:    "deadbeef",
+					SubtreeIndex: s,
+					StumpData:    buildFullSTUMP(allLeaves[s], 0, 700000),
+				}
+			}
+
+			compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+			if err != nil {
+				t.Fatalf("BuildCompoundBUMP failed: %v", err)
+			}
+
+			// Header-root validation — the failure mode in production.
+			if err := ValidateCompoundRoot(compound, &blockRoot); err != nil {
+				t.Fatalf("ValidateCompoundRoot failed: %v", err)
+			}
+
+			// Probe every txid in every subtree — the climb from each must
+			// reach the same block root. The production bug manifested as
+			// different "height: N" errors depending on which leaf was chosen
+			// first, so asserting every leaf catches those variants.
+			for s := 0; s < tc.numSubtrees; s++ {
+				for i := 0; i < tc.subtreeSize; i++ {
+					leaf := allLeaves[s][i]
+					root, err := compound.ComputeRoot(&leaf)
+					if err != nil {
+						t.Fatalf("subtree %d tx %d: ComputeRoot: %v", s, i, err)
+					}
+					if *root != blockRoot {
+						t.Fatalf("subtree %d tx %d: root mismatch: got %s want %s", s, i, root, blockRoot)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestBuildCompoundBUMP_39Subtrees_StructuralShape pins down the exact layout
+// of the compound BUMP for the production-shape block (39 subtrees). The
+// failure dump from block 000...fff29 showed no duplicate=true entries
+// anywhere and missing upper-level offsets; after the fix the compound must
+// contain Bitcoin's canonical padding at each odd level.
+func TestBuildCompoundBUMP_39Subtrees_StructuralShape(t *testing.T) {
+	const (
+		numSubtrees = 39
+		subtreeSize = 4 // height 2 — keeps the test fast, pads at levels 2, 5, 6
+	)
+	allLeaves, subtreeHashes, blockRoot := multiSubtreeTestSetup(numSubtrees, subtreeSize)
+
+	stumps := make([]*models.Stump, numSubtrees)
+	for s := 0; s < numSubtrees; s++ {
+		stumps[s] = &models.Stump{
+			BlockHash:    "deadbeef",
+			SubtreeIndex: s,
+			StumpData:    buildFullSTUMP(allLeaves[s], 0, 700000),
+		}
+	}
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, nil)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+	if err := ValidateCompoundRoot(compound, &blockRoot); err != nil {
+		t.Fatalf("ValidateCompoundRoot failed: %v", err)
+	}
+
+	// With subtreeSize=4 (internal height 2) and 39 subtrees (6 block levels),
+	// the canonical Bitcoin merkle tree padding produces exactly these counts
+	// and these duplicate-marker offsets. If this test ever starts failing,
+	// padAndComputeBlockLevel has regressed — inspect which level diverges.
+	want := []struct {
+		level    int
+		count    int
+		dupAt    []uint64 // offsets carrying Duplicate:true
+		minReal  uint64   // lowest real-hash offset
+		maxReal  uint64   // highest real-hash offset
+	}{
+		{level: 0, count: 39 * 4, minReal: 0, maxReal: 39*4 - 1},
+		{level: 1, count: 39 * 2, minReal: 0, maxReal: 39*2 - 1},
+		{level: 2, count: 40, dupAt: []uint64{39}, minReal: 0, maxReal: 38}, // subtree-root layer
+		{level: 3, count: 20, minReal: 0, maxReal: 19},
+		{level: 4, count: 10, minReal: 0, maxReal: 9},
+		{level: 5, count: 6, dupAt: []uint64{5}, minReal: 0, maxReal: 4},
+		{level: 6, count: 4, dupAt: []uint64{3}, minReal: 0, maxReal: 2},
+		{level: 7, count: 2, minReal: 0, maxReal: 1},
+	}
+	if got, wantLen := len(compound.Path), len(want); got != wantLen {
+		t.Fatalf("compound path levels = %d, want %d", got, wantLen)
+	}
+	for _, exp := range want {
+		elems := compound.Path[exp.level]
+		if len(elems) != exp.count {
+			t.Errorf("level %d: count = %d, want %d", exp.level, len(elems), exp.count)
+		}
+		dupSeen := map[uint64]bool{}
+		realOffsets := []uint64{}
+		for _, e := range elems {
+			if isDuplicate(e) {
+				dupSeen[e.Offset] = true
+				if e.Hash != nil {
+					t.Errorf("level %d offset %d: Duplicate entry must not carry a hash", exp.level, e.Offset)
+				}
+				continue
+			}
+			if e.Hash == nil {
+				t.Errorf("level %d offset %d: non-duplicate entry missing hash", exp.level, e.Offset)
+			}
+			realOffsets = append(realOffsets, e.Offset)
+		}
+		for _, off := range exp.dupAt {
+			if !dupSeen[off] {
+				t.Errorf("level %d: missing Duplicate entry at offset %d (seen=%v)", exp.level, off, dupSeen)
+			}
+		}
+		if len(exp.dupAt) == 0 && len(dupSeen) > 0 {
+			t.Errorf("level %d: unexpected Duplicate entries at %v", exp.level, dupSeen)
+		}
+		if len(realOffsets) > 0 {
+			minO, maxO := realOffsets[0], realOffsets[0]
+			for _, o := range realOffsets {
+				if o < minO {
+					minO = o
+				}
+				if o > maxO {
+					maxO = o
+				}
+			}
+			if minO != exp.minReal || maxO != exp.maxReal {
+				t.Errorf("level %d: real-offset range = [%d,%d], want [%d,%d]",
+					exp.level, minO, maxO, exp.minReal, exp.maxReal)
+			}
+		}
+	}
+}
+
+// TestBuildCompoundBUMP_NonPow2_WithCoinbase exercises the interaction between
+// coinbase placeholder replacement (which rewrites subtreeHashes[0] and
+// scrubs level-0 offset 0 hashes) and the non-pow2 block-level padding. Both
+// code paths mutate the same fullPath structure; this guards against one
+// undoing the other.
+func TestBuildCompoundBUMP_NonPow2_WithCoinbase(t *testing.T) {
+	const (
+		numSubtrees = 5
+		subtreeSize = 4
+	)
+	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(numSubtrees, subtreeSize)
+	cbBUMP := buildCoinbaseBUMP(trueAllLeaves[0], coinbaseTxID, 700000)
+
+	stumps := make([]*models.Stump, numSubtrees)
+	for s := 0; s < numSubtrees; s++ {
+		stumps[s] = &models.Stump{
+			BlockHash:    "deadbeef",
+			SubtreeIndex: s,
+			StumpData:    buildFullSTUMP(allLeaves[s], 0, 700000),
+		}
+	}
+
+	compound, _, err := BuildCompoundBUMP(stumps, subtreeHashes, cbBUMP)
+	if err != nil {
+		t.Fatalf("BuildCompoundBUMP failed: %v", err)
+	}
+	if err := ValidateCompoundRoot(compound, &trueBlockRoot); err != nil {
+		t.Fatalf("ValidateCompoundRoot failed: %v", err)
+	}
+	// Every tx (including the coinbase at subtree 0, offset 0) climbs cleanly.
+	for s := 0; s < numSubtrees; s++ {
+		for i := 0; i < subtreeSize; i++ {
+			leaf := trueAllLeaves[s][i]
+			root, err := compound.ComputeRoot(&leaf)
+			if err != nil {
+				t.Fatalf("subtree %d tx %d: ComputeRoot: %v", s, i, err)
+			}
+			if *root != trueBlockRoot {
+				t.Fatalf("subtree %d tx %d: root mismatch", s, i)
+			}
+		}
+	}
+}
+
+// TestComputeMissingHashes_HandlesDuplicateSibling verifies the extended
+// computeMissingHashes branch: when a node's sibling carries Duplicate:true,
+// the parent is MerkleTreeParent(node, node), matching BRC-74 verifier
+// semantics. Before the fix, computeMissingHashes silently skipped such
+// pairs, which produced holes in the compound BUMP whenever a subtree (or
+// block) level needed an odd-leaf duplicate.
+func TestComputeMissingHashes_HandlesDuplicateSibling(t *testing.T) {
+	dupTrue := true
+	leaves := generateTxHashes(3) // odd → canonical merkle pads the last
+	// Manually construct a 2-level path with real hashes + a Duplicate marker
+	// at the odd position.
+	l0 := []*transaction.PathElement{
+		{Offset: 0, Hash: &leaves[0]},
+		{Offset: 1, Hash: &leaves[1]},
+		{Offset: 2, Hash: &leaves[2]},
+		{Offset: 3, Duplicate: &dupTrue},
+	}
+	mp := &transaction.MerklePath{
+		BlockHeight: 100,
+		Path:        [][]*transaction.PathElement{l0, nil},
+	}
+	computeMissingHashes(mp)
+
+	if len(mp.Path[1]) != 2 {
+		t.Fatalf("level 1: count = %d, want 2", len(mp.Path[1]))
+	}
+	parent0 := findLeafByOffset(mp, 1, 0)
+	parent1 := findLeafByOffset(mp, 1, 1)
+	if parent0 == nil || parent0.Hash == nil {
+		t.Fatal("missing parent at level 1 offset 0")
+	}
+	if parent1 == nil || parent1.Hash == nil {
+		t.Fatal("missing parent at level 1 offset 1 (should be merkle(leaf2, leaf2))")
+	}
+	want := transaction.MerkleTreeParent(&leaves[2], &leaves[2])
+	if *parent1.Hash != *want {
+		t.Errorf("parent1 = %s, want merkle(leaf2, leaf2) = %s", parent1.Hash, want)
+	}
+}

@@ -111,7 +111,17 @@ func assembleFullPath(stumpData []byte, subtreeIndex int, subtreeHashes []chainh
 		})
 	}
 
+	// First pass: compute the STUMP's own subtree root at internalHeight from
+	// its level-0..internalHeight-1 data, and any block-level parents that
+	// happen to have both siblings already present.
 	computeMissingHashes(fullPath)
+
+	// Second pass: Bitcoin-canonical padding above the subtree-root layer.
+	// Required whenever numSubtrees is not a power of two — otherwise the
+	// compound BUMP is missing siblings for every climb that touches the
+	// padded region and ComputeRoot errors with "we do not have a hash for
+	// this index at height: N".
+	padAndComputeBlockLevel(fullPath, internalHeight, numSubtrees)
 	return fullPath, txOffset, nil
 }
 
