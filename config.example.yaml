@@ -50,3 +50,22 @@ bump_builder:
   # Grace window after BLOCK_PROCESSED before reading STUMPs, to allow for
   # late merkle-service retries of any STUMPs that initially got a 5xx.
   grace_window_ms: 30000
+
+# Shared on-disk root for arcade state. Chaintracks headers default to
+# <storage_path>/chaintracks/.
+# storage_path: "~/.arcade"
+
+# Embedded block-header tracker (go-chaintracks). Serves routes under
+# /chaintracks/v1/* and /chaintracks/v2/* on the api-server. Default is on
+# so the refactor is a drop-in replacement for the original arcade binary.
+# Set enabled: false in environments without outbound P2P.
+chaintracks_server:
+  enabled: true
+
+# go-chaintracks library config. See that library's docs for the full set.
+# Defaults are inherited from the library's SetDefaults — uncomment to override.
+# chaintracks:
+#   mode: embedded         # or "remote" with url set to a running chaintracks
+#   storage_path: ""       # defaults to <storage_path>/chaintracks
+#   bootstrap_url: ""
+#   bootstrap_mode: api

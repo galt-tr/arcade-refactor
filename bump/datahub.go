@@ -11,6 +11,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/bsv-blockchain/go-sdk/util"
 )
 
 var httpClient = &http.Client{Timeout: 5 * time.Minute}
@@ -82,19 +83,19 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 	r := bytes.NewReader(data[80:]) // skip block header
 
 	// Read transaction count (varint)
-	var txCount transaction.VarInt
+	var txCount util.VarInt
 	if _, err := txCount.ReadFrom(r); err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read transaction count: %w", err)
 	}
 
 	// Read size in bytes (varint)
-	var sizeBytes transaction.VarInt
+	var sizeBytes util.VarInt
 	if _, err := sizeBytes.ReadFrom(r); err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read size in bytes: %w", err)
 	}
 
 	// Read subtree count (varint)
-	var subtreeCount transaction.VarInt
+	var subtreeCount util.VarInt
 	if _, err := subtreeCount.ReadFrom(r); err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read subtree count: %w", err)
 	}
@@ -124,13 +125,13 @@ func parseBlockBinary(data []byte) ([]chainhash.Hash, []byte, *chainhash.Hash, e
 	r = bytes.NewReader(remaining[txBytesUsed:])
 
 	// Read block height (varint)
-	var blockHeight transaction.VarInt
+	var blockHeight util.VarInt
 	if _, err := blockHeight.ReadFrom(r); err != nil {
 		return hashes, nil, headerMerkleRoot, nil
 	}
 
 	// Read coinbase BUMP length (varint)
-	var cbBUMPLen transaction.VarInt
+	var cbBUMPLen util.VarInt
 	if _, err := cbBUMPLen.ReadFrom(r); err != nil {
 		return hashes, nil, headerMerkleRoot, nil
 	}

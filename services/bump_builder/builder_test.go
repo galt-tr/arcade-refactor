@@ -15,6 +15,7 @@ import (
 	"github.com/IBM/sarama"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/bsv-blockchain/go-sdk/util"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/bump"
@@ -173,7 +174,7 @@ func newDatahubServer(merkleRoot []byte, subtreeHashes []chainhash.Hash) *httpte
 		buf.WriteByte(0x00)
 
 		// Subtree count (varint)
-		buf.Write(transaction.VarInt(len(subtreeHashes)).Bytes())
+		buf.Write(util.VarInt(len(subtreeHashes)).Bytes())
 
 		// Subtree hashes (32 bytes each, internal byte order)
 		for i := range subtreeHashes {
@@ -203,7 +204,7 @@ func newDatahubServerWithCoinbaseBUMP(merkleRoot []byte, subtreeHashes []chainha
 		buf.Write(buildBlockHeader(merkleRoot))                   // header
 		buf.WriteByte(0x01)                                       // txCount
 		buf.WriteByte(0x00)                                       // sizeBytes
-		buf.Write(transaction.VarInt(len(subtreeHashes)).Bytes()) // subtreeCount
+		buf.Write(util.VarInt(len(subtreeHashes)).Bytes()) // subtreeCount
 
 		for i := range subtreeHashes {
 			buf.Write(subtreeHashes[i].CloneBytes())
@@ -215,7 +216,7 @@ func newDatahubServerWithCoinbaseBUMP(merkleRoot []byte, subtreeHashes []chainha
 		buf.WriteByte(0x01) // blockHeight
 
 		// Coinbase BUMP length + data
-		buf.Write(transaction.VarInt(len(coinbaseBUMP)).Bytes())
+		buf.Write(util.VarInt(len(coinbaseBUMP)).Bytes())
 		buf.Write(coinbaseBUMP)
 
 		w.Header().Set("Content-Type", "application/octet-stream")

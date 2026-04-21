@@ -2,6 +2,7 @@
 package validator
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -117,8 +118,9 @@ func (v *Validator) MinFeePerKB() uint64 {
 }
 
 // ValidateTransaction validates policy, and optionally fees and scripts.
-// Adapted for go-sdk v1.1.22 API where spv.Verify takes 3 args (no context).
-func (v *Validator) ValidateTransaction(_ interface{}, tx *sdkTx.Transaction, skipFees, skipScripts bool) error {
+// Uses go-sdk v1.2.19's spv.Verify which takes a context.Context as its first
+// argument. Callers that don't have a ctx can pass context.TODO().
+func (v *Validator) ValidateTransaction(ctx context.Context, tx *sdkTx.Transaction, skipFees, skipScripts bool) error {
 	if err := v.ValidatePolicy(tx); err != nil {
 		return v.wrapPolicyError(err)
 	}
@@ -137,8 +139,12 @@ func (v *Validator) ValidateTransaction(_ interface{}, tx *sdkTx.Transaction, sk
 		ct = &spv.GullibleHeadersClient{}
 	}
 
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+
 	if ct != nil || feeModel != nil {
-		if _, err := spv.Verify(tx, ct, feeModel); err != nil {
+		if _, err := spv.Verify(ctx, tx, ct, feeModel); err != nil {
 			return v.wrapSPVError(err)
 		}
 	}

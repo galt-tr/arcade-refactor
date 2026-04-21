@@ -4,25 +4,41 @@ import (
 	"fmt"
 	"strings"
 
+	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
 type Config struct {
-	Mode          string   `mapstructure:"mode"`
-	LogLevel      string   `mapstructure:"log_level"`
-	CallbackURL   string   `mapstructure:"callback_url"`
-	CallbackToken string   `mapstructure:"callback_token"`
-	APIServer     API      `mapstructure:"api"`
-	Kafka         Kafka    `mapstructure:"kafka"`
-	Aerospike     Aero     `mapstructure:"aerospike"`
-	DatahubURLs   []string `mapstructure:"datahub_urls"`
+	Mode          string              `mapstructure:"mode"`
+	LogLevel      string              `mapstructure:"log_level"`
+	CallbackURL   string              `mapstructure:"callback_url"`
+	CallbackToken string              `mapstructure:"callback_token"`
+	StoragePath   string              `mapstructure:"storage_path"`
+	APIServer     API                 `mapstructure:"api"`
+	Kafka         Kafka               `mapstructure:"kafka"`
+	Aerospike     Aero                `mapstructure:"aerospike"`
+	DatahubURLs   []string            `mapstructure:"datahub_urls"`
 	Teranode      TeranodeConfig      `mapstructure:"teranode"`
 	MerkleService MerkleServiceConfig `mapstructure:"merkle_service"`
 	P2P           P2PConfig           `mapstructure:"p2p"`
 	Health        HealthConfig        `mapstructure:"health"`
 	Propagation   PropagationConfig   `mapstructure:"propagation"`
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
+	// ChaintracksServer gates whether the embedded go-chaintracks HTTP API
+	// runs alongside api-server. Default is on so the refactor is a drop-in
+	// replacement for the original single-binary arcade.
+	ChaintracksServer ChaintracksServerConfig `mapstructure:"chaintracks_server"`
+	// Chaintracks is the upstream go-chaintracks config; defaults delegated
+	// to the library's own SetDefaults so new fields flow through automatically.
+	Chaintracks chaintracksconfig.Config `mapstructure:"chaintracks"`
+}
+
+// ChaintracksServerConfig toggles the chaintracks HTTP surface. Separate from
+// Chaintracks itself so the instance can be disabled without wiping the
+// library's config block.
+type ChaintracksServerConfig struct {
+	Enabled bool `mapstructure:"enabled"`
 }
 
 type API struct {
@@ -151,6 +167,13 @@ func setDefaults() {
 	// automatically moves the lease TTL unless the operator opts into a fixed value.
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
 	viper.SetDefault("propagation.teranode_max_batch_size", 100)
+
+	viper.SetDefault("storage_path", "~/.arcade")
+	viper.SetDefault("chaintracks_server.enabled", true)
+	// Delegate chaintracks-library defaults (mode, network, bootstrap, p2p, …)
+	// to the upstream SetDefaults so any new fields are picked up automatically.
+	var ct chaintracksconfig.Config
+	ct.SetDefaults(viper.GetViper(), "chaintracks")
 	viper.SetDefault("bump_builder.grace_window_ms", 30000)
 }
 
