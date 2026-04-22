@@ -107,12 +107,30 @@ func (s *AerospikeStore) EnsureIndexes() error {
 		{setProcessedBlocks, "block_height", "idx_pb_block_height", aero.NUMERIC},
 		{setTransactions, "status", "idx_tx_status", aero.STRING},
 	}
+	// CreateIndex returns an IndexTask that must be polled — the server call
+	// is asynchronous and the index won't be queryable on every node until
+	// the task is done. Skipping this wait was the proximate cause of the
+	// INDEX_NOTFOUND storm we saw in production: the service started
+	// consuming Kafka messages before propagation finished, every query
+	// returned an error, the client retried, and the connection pool drained.
 	for _, idx := range indexes {
-		_, err := s.client.CreateIndex(nil, s.namespace, idx.set, idx.name, idx.bin, idx.indexType)
+		task, err := s.client.CreateIndex(nil, s.namespace, idx.set, idx.name, idx.bin, idx.indexType)
 		if err != nil {
-			if !strings.Contains(err.Error(), "Index already exists") {
-				return fmt.Errorf("creating index %s: %w", idx.name, err)
+			if strings.Contains(err.Error(), "Index already exists") {
+				continue
 			}
+			return fmt.Errorf("creating index %s: %w", idx.name, err)
+		}
+		if task == nil {
+			continue
+		}
+		select {
+		case taskErr := <-task.OnComplete():
+			if taskErr != nil {
+				return fmt.Errorf("waiting for index %s: %w", idx.name, taskErr)
+			}
+		case <-time.After(30 * time.Second):
+			return fmt.Errorf("timed out waiting for index %s to build", idx.name)
 		}
 	}
 	return nil
