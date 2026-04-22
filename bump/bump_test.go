@@ -3,6 +3,7 @@ package bump
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -1499,5 +1500,114 @@ func TestComputeMissingHashes_HandlesDuplicateSibling(t *testing.T) {
 	want := transaction.MerkleTreeParent(&leaves[2], &leaves[2])
 	if *parent1.Hash != *want {
 		t.Errorf("parent1 = %s, want merkle(leaf2, leaf2) = %s", parent1.Hash, want)
+	}
+}
+
+// --- Coinbase pre-correction order-independence regression ---
+//
+// Production incident (block 00000000847b80c9360e93d0141477abbd3c6c3510ca359c005738c9a07560a8,
+// arcade-v2-ttn): BuildCompoundBUMP failed ValidateCompoundRoot whenever the
+// stumps slice was not in subtree-index order. Root cause:
+// computeCorrectedSubtreeRoot returned mp.Path[height-1][0].Hash (the LEFT
+// child of the subtree root) instead of H(mp.Path[height-1][0],
+// mp.Path[height-1][1]) (the root). subtreeHashes[0] was silently corrupted.
+//
+// The merge in BuildCompoundBUMP dedupes by (level, offset) with first-seen
+// wins. When subtree 0 is processed first, its own assembleFullPath
+// independently climbs from level 0 and places the CORRECT root at
+// (internalHeight, 0) before any other subtree writes the corrupt value
+// there — the merge preserves the correct entry and validation passes. When
+// any other subtree is first, it writes the corrupt subtreeHashes[0] into the
+// same slot and subtree 0's later correct value is ignored. Aerospike returns
+// stumps in non-deterministic order, so prod surfaced it once the order
+// happened to be [2,4,5,3,0,1].
+//
+// This test pins down the fix by running the exact production-shape
+// permutation plus several other orderings. All must validate.
+
+func TestBuildCompoundBUMP_CoinbaseReplacement_OrderIndependence(t *testing.T) {
+	const (
+		numSubtrees = 6
+		subtreeSize = 8 // pow2 ≥2 is sufficient to reproduce; larger only adds runtime
+	)
+	allLeaves, trueAllLeaves, subtreeHashes, coinbaseTxID, trueBlockRoot := setupCoinbaseBlock(numSubtrees, subtreeSize)
+	cbBUMP := buildCoinbaseBUMP(trueAllLeaves[0], coinbaseTxID, 700000)
+
+	orderings := [][]int{
+		{0, 1, 2, 3, 4, 5}, // baseline — this was the only order the old code happened to handle
+		{5, 4, 3, 2, 1, 0},
+		{2, 4, 5, 3, 0, 1}, // production Aerospike order that triggered the incident
+		{1, 0, 2, 3, 4, 5}, // subtree 0 second — minimal shift that still breaks old code
+		{3, 2, 1, 5, 4, 0}, // subtree 0 last
+	}
+
+	for _, order := range orderings {
+		order := order
+		t.Run(fmt.Sprintf("order_%v", order), func(t *testing.T) {
+			// Each run needs a fresh subtreeHashes copy — BuildCompoundBUMP
+			// mutates subtreeHashes[0] via the pre-correction step.
+			localHashes := make([]chainhash.Hash, len(subtreeHashes))
+			copy(localHashes, subtreeHashes)
+
+			stumps := make([]*models.Stump, numSubtrees)
+			for i, idx := range order {
+				stumps[i] = &models.Stump{
+					BlockHash:    "deadbeef",
+					SubtreeIndex: idx,
+					StumpData:    buildFullSTUMP(allLeaves[idx], 0, 700000),
+				}
+			}
+
+			compound, _, err := BuildCompoundBUMP(stumps, localHashes, cbBUMP)
+			if err != nil {
+				t.Fatalf("BuildCompoundBUMP failed: %v", err)
+			}
+			if err := ValidateCompoundRoot(compound, &trueBlockRoot); err != nil {
+				t.Fatalf("ValidateCompoundRoot failed (order %v): %v", order, err)
+			}
+
+			// Every true txid (coinbase + non-coinbase, all subtrees) must
+			// climb to the canonical block root. This catches subtler variants
+			// where the compound passes header validation but individual
+			// per-tx paths diverge.
+			for s := 0; s < numSubtrees; s++ {
+				for i := 0; i < subtreeSize; i++ {
+					leaf := trueAllLeaves[s][i]
+					root, err := compound.ComputeRoot(&leaf)
+					if err != nil {
+						t.Fatalf("subtree %d tx %d: ComputeRoot: %v", s, i, err)
+					}
+					if *root != trueBlockRoot {
+						t.Fatalf("subtree %d tx %d: root mismatch (order %v): got %s want %s",
+							s, i, order, root, trueBlockRoot)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestComputeCorrectedSubtreeRoot_ReturnsRealRoot targets the buggy function
+// directly: for a known subtree-0 layout (placeholder at offset 0 + known
+// coinbase), the returned hash must equal the merkle root of the same leaves
+// with offset 0 replaced by the real coinbase txid — NOT the left child of
+// that root. Covers multiple subtree heights so no pow2 case regresses.
+func TestComputeCorrectedSubtreeRoot_ReturnsRealRoot(t *testing.T) {
+	sizes := []int{2, 4, 8, 16, 32, 1024}
+	for _, size := range sizes {
+		size := size
+		t.Run(fmt.Sprintf("subtreeSize_%d", size), func(t *testing.T) {
+			allLeaves, trueAllLeaves, _, coinbaseTxID, _ := setupCoinbaseBlock(1, size)
+			stumpData := buildFullSTUMP(allLeaves[0], 0, 700000)
+
+			got, err := computeCorrectedSubtreeRoot(stumpData, &coinbaseTxID)
+			if err != nil {
+				t.Fatalf("computeCorrectedSubtreeRoot failed: %v", err)
+			}
+			want := computeMerkleRootFromLeaves(trueAllLeaves[0])
+			if *got != want {
+				t.Fatalf("size=%d: got %s, want %s (actual subtree root)", size, got, want)
+			}
+		})
 	}
 }

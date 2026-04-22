@@ -209,32 +209,26 @@ func applyCoinbaseToSTUMP(stumpPath *transaction.MerklePath, coinbaseTxID *chain
 }
 
 // computeCorrectedSubtreeRoot parses a subtree 0 STUMP, replaces the placeholder
-// with the real coinbase txid, builds the full tree, and returns the corrected root.
+// with the real coinbase txid, and returns the corrected subtree root by climbing
+// from the coinbase leaf via the BRC-74 ComputeRoot algorithm.
+//
+// The prior implementation built only the STUMP's level 0 and called
+// computeMissingHashes, then returned mp.Path[height-1][0].Hash — but that
+// element is the LEFT child of the subtree root, not the root itself
+// (the root is H(mp.Path[height-1][0], mp.Path[height-1][1])). For any
+// pow2-sized subtree ≥2 leaves, the returned value was a mid-level hash, and
+// subtreeHashes[0] was silently corrupted. The compound BUMP merge uses
+// first-seen-wins by (level, offset), so the bug only surfaced when subtree 0
+// was not the first stump processed — i.e., it depended on the Aerospike read
+// order and went undetected until a production block with 6 subtrees was
+// delivered in order [2,4,5,3,0,1].
 func computeCorrectedSubtreeRoot(stumpData []byte, coinbaseTxID *chainhash.Hash) (*chainhash.Hash, error) {
 	stumpPath, err := transaction.NewMerklePathFromBinary(stumpData)
 	if err != nil {
 		return nil, err
 	}
 	applyCoinbaseToSTUMP(stumpPath, coinbaseTxID, nil)
-
-	// Build full tree from level 0 to get the root.
-	height := len(stumpPath.Path)
-	fullTree := &transaction.MerklePath{
-		BlockHeight: stumpPath.BlockHeight,
-		Path:        make([][]*transaction.PathElement, height),
-	}
-	// Only copy level 0 (all leaves) — let ComputeMissingHashes build the rest.
-	for _, elem := range stumpPath.Path[0] {
-		addLeaf(fullTree,0, elem)
-	}
-	computeMissingHashes(fullTree)
-
-	// The root is the single element at the highest computed level.
-	topLevel := fullTree.Path[height-1]
-	if len(topLevel) > 0 && topLevel[0].Hash != nil {
-		return topLevel[0].Hash, nil
-	}
-	return nil, fmt.Errorf("failed to compute corrected subtree root")
+	return stumpPath.ComputeRoot(coinbaseTxID)
 }
 
 // ExtractMinimalPath extracts the minimal set of nodes needed to verify a single
