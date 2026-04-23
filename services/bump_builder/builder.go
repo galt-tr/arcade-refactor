@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"go.uber.org/zap"
@@ -24,29 +23,27 @@ type Builder struct {
 	cfg      *config.Config
 	logger   *zap.Logger
 	store    store.Store
-	consumer *kafka.ConsumerGroup
 	producer *kafka.Producer
+	consumer *kafka.ConsumerGroup
 }
 
-func New(cfg *config.Config, logger *zap.Logger, st store.Store) *Builder {
+// New constructs a Builder. producer is the shared process-wide producer —
+// the builder reuses it (for DLQ routing) rather than creating a duplicate
+// connection.
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store) *Builder {
 	return &Builder{
-		cfg:    cfg,
-		logger: logger.Named("bump-builder"),
-		store:  st,
+		cfg:      cfg,
+		logger:   logger.Named("bump-builder"),
+		store:    st,
+		producer: producer,
 	}
 }
 
 func (b *Builder) Name() string { return "bump-builder" }
 
 func (b *Builder) Start(ctx context.Context) error {
-	producer, err := kafka.NewProducer(b.cfg.Kafka.Brokers)
-	if err != nil {
-		return fmt.Errorf("creating kafka producer: %w", err)
-	}
-	b.producer = producer
-
 	consumer, err := kafka.NewConsumerGroup(kafka.ConsumerConfig{
-		Brokers:    b.cfg.Kafka.Brokers,
+		Broker:     b.producer.Broker(),
 		GroupID:    b.cfg.Kafka.ConsumerGroup + "-bump-builder",
 		Topics:     []string{kafka.TopicBlockProcessed},
 		Handler:    b.handleMessage,
@@ -67,24 +64,13 @@ func (b *Builder) Start(ctx context.Context) error {
 
 func (b *Builder) Stop() error {
 	b.logger.Info("stopping bump builder")
-	var errs []error
 	if b.consumer != nil {
-		if err := b.consumer.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if b.producer != nil {
-		if err := b.producer.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("errors stopping bump builder: %v", errs)
+		return b.consumer.Close()
 	}
 	return nil
 }
 
-func (b *Builder) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
+func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	var callback models.CallbackMessage
 	if err := json.Unmarshal(msg.Value, &callback); err != nil {
 		return fmt.Errorf("unmarshaling block processed message: %w", err)

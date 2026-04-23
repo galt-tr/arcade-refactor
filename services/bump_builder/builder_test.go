@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/go-sdk/util"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -126,14 +126,14 @@ func (m *mockStore) addStump(blockHash string, subtreeIndex int, stumpData []byt
 
 // --- Helpers ---
 
-// makeBlockProcessedMsg creates a Kafka ConsumerMessage with a block_processed payload.
-func makeBlockProcessedMsg(blockHash string) *sarama.ConsumerMessage {
+// makeBlockProcessedMsg creates a kafka.Message with a block_processed payload.
+func makeBlockProcessedMsg(blockHash string) *kafka.Message {
 	callback := models.CallbackMessage{
 		Type:      models.CallbackBlockProcessed,
 		BlockHash: blockHash,
 	}
 	data, _ := json.Marshal(callback)
-	return &sarama.ConsumerMessage{
+	return &kafka.Message{
 		Topic: "arcade.block_processed",
 		Value: data,
 	}
@@ -540,7 +540,7 @@ func TestBuilder_HandleMessage_InvalidJSON_ReturnsError(t *testing.T) {
 
 	b := newTestBuilder(ms, datahub.URL)
 
-	msg := &sarama.ConsumerMessage{
+	msg := &kafka.Message{
 		Topic: "arcade.block_processed",
 		Value: []byte("not json"),
 	}

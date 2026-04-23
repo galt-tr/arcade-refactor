@@ -1,133 +1,71 @@
 package kafka
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-
-	"github.com/IBM/sarama"
 )
 
+// Producer is the service-facing convenience wrapper over Broker. It takes Go
+// values (any), JSON-marshals them, and hands the bytes to the configured
+// broker. Services depend on *Producer rather than Broker directly because
+// every caller today passes a struct — not doing the marshal here would force
+// boilerplate in every call site.
 type Producer struct {
-	syncProducer  sarama.SyncProducer
-	asyncProducer sarama.AsyncProducer
-	brokers       []string
+	broker Broker
 }
 
-func NewProducer(brokers []string) (*Producer, error) {
-	cfg := sarama.NewConfig()
-	cfg.Producer.RequiredAcks = sarama.WaitForAll
-	cfg.Producer.Retry.Max = 5
-	cfg.Producer.Return.Successes = true
-	cfg.Producer.Return.Errors = true
-
-	syncProducer, err := sarama.NewSyncProducer(brokers, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("creating sync producer: %w", err)
-	}
-
-	asyncCfg := sarama.NewConfig()
-	asyncCfg.Producer.RequiredAcks = sarama.WaitForLocal
-	asyncCfg.Producer.Retry.Max = 5
-	asyncCfg.Producer.Return.Successes = true
-	asyncCfg.Producer.Return.Errors = true
-
-	asyncProducer, err := sarama.NewAsyncProducer(brokers, asyncCfg)
-	if err != nil {
-		syncProducer.Close()
-		return nil, fmt.Errorf("creating async producer: %w", err)
-	}
-
-	return &Producer{
-		syncProducer:  syncProducer,
-		asyncProducer: asyncProducer,
-		brokers:       brokers,
-	}, nil
+// NewProducer wraps a Broker. Construction is cheap — the broker owns the
+// real connection pools.
+func NewProducer(broker Broker) *Producer {
+	return &Producer{broker: broker}
 }
 
-// Send publishes a message synchronously and waits for acknowledgement.
+// Send JSON-marshals value and publishes synchronously.
 func (p *Producer) Send(topic string, key string, value any) error {
-	data, err := json.Marshal(value)
+	data, err := marshalValue(value)
 	if err != nil {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
-
-	msg := &sarama.ProducerMessage{
-		Topic: topic,
-		Key:   sarama.StringEncoder(key),
-		Value: sarama.ByteEncoder(data),
-	}
-
-	_, _, err = p.syncProducer.SendMessage(msg)
-	if err != nil {
-		return fmt.Errorf("sending message to %s: %w", topic, err)
-	}
-
-	return nil
+	return p.broker.Send(context.Background(), topic, key, data)
 }
 
-// SendAsync publishes a message asynchronously without waiting.
+// SendAsync JSON-marshals value and publishes fire-and-forget.
 func (p *Producer) SendAsync(topic string, key string, value any) error {
-	data, err := json.Marshal(value)
+	data, err := marshalValue(value)
 	if err != nil {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
-
-	msg := &sarama.ProducerMessage{
-		Topic: topic,
-		Key:   sarama.StringEncoder(key),
-		Value: sarama.ByteEncoder(data),
-	}
-
-	p.asyncProducer.Input() <- msg
-	return nil
+	return p.broker.SendAsync(context.Background(), topic, key, data)
 }
 
-// KeyValue represents a single message in a batch publish.
-type KeyValue struct {
-	Key   string
-	Value any
-}
-
-// SendBatch publishes multiple messages to the same topic in a single batch call.
+// SendBatch publishes multiple values to the same topic. Each KeyValue.Value
+// is JSON-marshaled before the batch is forwarded to the broker.
 func (p *Producer) SendBatch(topic string, msgs []KeyValue) error {
-	if len(msgs) == 0 {
-		return nil
-	}
-
-	saramaMsgs := make([]*sarama.ProducerMessage, 0, len(msgs))
-	for _, m := range msgs {
-		data, err := json.Marshal(m.Value)
-		if err != nil {
-			return fmt.Errorf("marshaling batch message: %w", err)
-		}
-		msg := &sarama.ProducerMessage{
-			Topic: topic,
-			Value: sarama.ByteEncoder(data),
-		}
-		if m.Key != "" {
-			msg.Key = sarama.StringEncoder(m.Key)
-		}
-		saramaMsgs = append(saramaMsgs, msg)
-	}
-
-	if err := p.syncProducer.SendMessages(saramaMsgs); err != nil {
-		return fmt.Errorf("sending batch to %s: %w", topic, err)
-	}
-
-	return nil
+	return p.broker.SendBatch(context.Background(), topic, msgs)
 }
 
-// Close shuts down both producers.
+// SendRaw publishes pre-marshalled bytes. Used by consumer DLQ routing so we
+// don't double-encode.
+func (p *Producer) SendRaw(topic, key string, value []byte) error {
+	return p.broker.Send(context.Background(), topic, key, value)
+}
+
+// Broker returns the underlying broker, used by ConsumerGroup to Subscribe.
+func (p *Producer) Broker() Broker {
+	return p.broker
+}
+
+// Close tears down the underlying broker.
 func (p *Producer) Close() error {
-	var errs []error
-	if err := p.syncProducer.Close(); err != nil {
-		errs = append(errs, err)
+	return p.broker.Close()
+}
+
+// marshalValue JSON-encodes a Go value for transport. Extracted so batch and
+// single paths share the same behavior.
+func marshalValue(value any) ([]byte, error) {
+	if raw, ok := value.([]byte); ok {
+		return raw, nil
 	}
-	if err := p.asyncProducer.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("closing producers: %v", errs)
-	}
-	return nil
+	return json.Marshal(value)
 }

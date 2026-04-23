@@ -46,7 +46,11 @@ type API struct {
 	Port int    `mapstructure:"port"`
 }
 
+// Kafka configures the message broker. Backend picks between a real Sarama
+// client (production, multi-node) and an in-process memory broker (single-
+// binary standalone mode). Brokers is required only when Backend=sarama.
 type Kafka struct {
+	Backend       string   `mapstructure:"backend"` // "sarama" (default) or "memory"
 	Brokers       []string `mapstructure:"brokers"`
 	ConsumerGroup string   `mapstructure:"consumer_group"`
 	MaxRetries    int      `mapstructure:"max_retries"`
@@ -152,6 +156,7 @@ func setDefaults() {
 	viper.SetDefault("log_level", "info")
 	viper.SetDefault("api.host", "0.0.0.0")
 	viper.SetDefault("api.port", 8080)
+	viper.SetDefault("kafka.backend", "sarama")
 	viper.SetDefault("kafka.brokers", []string{"localhost:9092"})
 	viper.SetDefault("kafka.consumer_group", "arcade")
 	viper.SetDefault("kafka.max_retries", 5)
@@ -184,8 +189,15 @@ func setDefaults() {
 }
 
 func validate(cfg *Config) error {
-	if len(cfg.Kafka.Brokers) == 0 {
-		return fmt.Errorf("kafka.brokers is required")
+	switch cfg.Kafka.Backend {
+	case "", "sarama":
+		if len(cfg.Kafka.Brokers) == 0 {
+			return fmt.Errorf("kafka.brokers is required when kafka.backend=sarama")
+		}
+	case "memory":
+		// no external config required
+	default:
+		return fmt.Errorf("unknown kafka.backend %q (expected sarama or memory)", cfg.Kafka.Backend)
 	}
 	if len(cfg.Aerospike.Hosts) == 0 {
 		return fmt.Errorf("aerospike.hosts is required")

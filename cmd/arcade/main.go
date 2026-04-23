@@ -49,12 +49,16 @@ func run(cmd *cobra.Command, _ []string) error {
 	logger := newLogger(cfg.LogLevel)
 	defer logger.Sync()
 
-	logger.Info("starting arcade", zap.String("mode", cfg.Mode))
+	logger.Info("starting arcade",
+		zap.String("mode", cfg.Mode),
+		zap.String("kafka_backend", cfg.Kafka.Backend),
+	)
 
-	producer, err := kafka.NewProducer(cfg.Kafka.Brokers)
+	broker, err := kafka.NewBroker(cfg.Kafka)
 	if err != nil {
-		return fmt.Errorf("creating kafka producer: %w", err)
+		return fmt.Errorf("creating kafka broker: %w", err)
 	}
+	producer := kafka.NewProducer(broker)
 	defer producer.Close()
 
 	aeroStore, err := store.NewAerospikeStore(cfg.Aerospike)
@@ -146,7 +150,7 @@ func buildServices(
 		svcs = append(svcs, api_server.New(cfg, logger, producer, aeroStore, txTracker))
 	}
 	if shouldRun("bump-builder") {
-		svcs = append(svcs, bump_builder.New(cfg, logger, aeroStore))
+		svcs = append(svcs, bump_builder.New(cfg, logger, producer, aeroStore))
 	}
 	if shouldRun("tx-validator") {
 		svcs = append(svcs, tx_validator.New(cfg, logger, producer, aeroStore, txTracker, txVal))

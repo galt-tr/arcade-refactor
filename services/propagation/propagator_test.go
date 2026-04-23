@@ -13,9 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IBM/sarama"
-
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
@@ -262,8 +261,8 @@ func makePropMsg(txid string) []byte {
 	return b
 }
 
-func consumerMsg(payload []byte) *sarama.ConsumerMessage {
-	return &sarama.ConsumerMessage{Value: payload}
+func consumerMsg(payload []byte) *kafka.Message {
+	return &kafka.Message{Value: payload}
 }
 
 func newMerkleServer(log *eventLog, statusCode int) *httptest.Server {

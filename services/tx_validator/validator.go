@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/IBM/sarama"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 	"go.uber.org/zap"
 
@@ -47,7 +46,7 @@ func (v *Validator) Name() string { return "tx-validator" }
 
 func (v *Validator) Start(ctx context.Context) error {
 	consumer, err := kafka.NewConsumerGroup(kafka.ConsumerConfig{
-		Brokers:    v.cfg.Kafka.Brokers,
+		Broker:     v.producer.Broker(),
 		GroupID:    v.cfg.Kafka.ConsumerGroup + "-tx-validator",
 		Topics:     []string{kafka.TopicTransaction},
 		Handler:    v.handleMessage,
@@ -78,7 +77,7 @@ type txMessage struct {
 	RawTx  string `json:"raw_tx,omitempty"`
 }
 
-func (v *Validator) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
+func (v *Validator) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	var txMsg txMessage
 	if err := json.Unmarshal(msg.Value, &txMsg); err != nil {
 		return fmt.Errorf("unmarshaling message: %w", err)

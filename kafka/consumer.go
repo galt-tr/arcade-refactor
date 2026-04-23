@@ -6,17 +6,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/IBM/sarama"
 	"go.uber.org/zap"
 )
 
-// MessageHandler processes a single Kafka message.
-// Return an error to trigger retry/DLQ logic.
-type MessageHandler func(ctx context.Context, msg *sarama.ConsumerMessage) error
-
-// ConsumerGroup wraps a Sarama consumer group with dead-letter routing.
+// ConsumerGroup is the service-facing consumer wrapper. It owns the
+// drain-then-flush + retry + DLQ logic so services only supply a per-message
+// handler and an optional batch-flush hook. The underlying Broker supplies
+// the transport (Sarama or in-memory).
 type ConsumerGroup struct {
-	group      sarama.ConsumerGroup
+	broker     Broker
+	sub        Subscription
 	topics     []string
 	handler    MessageHandler
 	flushFunc  func() error
@@ -27,24 +26,23 @@ type ConsumerGroup struct {
 }
 
 type ConsumerConfig struct {
-	Brokers    []string
+	Broker     Broker
 	GroupID    string
 	Topics     []string
 	Handler    MessageHandler
-	FlushFunc  func() error // called when claim channel drains or session ends
-	Producer   *Producer
+	FlushFunc  func() error // called when claim channel drains or ends
+	Producer   *Producer    // used for DLQ routing
 	MaxRetries int
 	Logger     *zap.Logger
 }
 
 func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
-	saramaCfg := sarama.NewConfig()
-	saramaCfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
-	saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
-
-	group, err := sarama.NewConsumerGroup(cfg.Brokers, cfg.GroupID, saramaCfg)
+	if cfg.Broker == nil {
+		return nil, fmt.Errorf("ConsumerConfig.Broker is required")
+	}
+	sub, err := cfg.Broker.Subscribe(cfg.GroupID, cfg.Topics)
 	if err != nil {
-		return nil, fmt.Errorf("creating consumer group: %w", err)
+		return nil, fmt.Errorf("subscribing: %w", err)
 	}
 
 	maxRetries := cfg.MaxRetries
@@ -53,7 +51,8 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 	}
 
 	return &ConsumerGroup{
-		group:      group,
+		broker:     cfg.Broker,
+		sub:        sub,
 		topics:     cfg.Topics,
 		handler:    cfg.Handler,
 		flushFunc:  cfg.FlushFunc,
@@ -64,48 +63,28 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 	}, nil
 }
 
-// Run starts consuming messages. Blocks until context is cancelled.
+// Run drives the subscription. Blocks until ctx is cancelled or the broker
+// closes. Each call to handleClaim preserves the drain-then-flush invariant:
+// all immediately-available messages are processed, then flushFunc fires,
+// then the next iteration waits for new arrivals.
 func (c *ConsumerGroup) Run(ctx context.Context) error {
-	for {
-		if err := c.group.Consume(ctx, c.topics, c); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			c.logger.Error("consumer group error", zap.Error(err))
-		}
-		if ctx.Err() != nil {
-			return nil
-		}
-		c.ready = make(chan struct{})
-	}
+	close(c.ready)
+	return c.sub.Consume(ctx, c.handleClaim)
 }
 
-// Ready returns a channel that is closed when the consumer is ready.
+// Ready returns a channel closed once the subscription is live (for tests).
 func (c *ConsumerGroup) Ready() <-chan struct{} {
 	return c.ready
 }
 
-// Close shuts down the consumer group.
 func (c *ConsumerGroup) Close() error {
-	return c.group.Close()
+	return c.sub.Close()
 }
 
-// Setup is called at the beginning of a new consumer group session.
-func (c *ConsumerGroup) Setup(sarama.ConsumerGroupSession) error {
-	close(c.ready)
-	return nil
-}
-
-// Cleanup is called at the end of a consumer group session.
-func (c *ConsumerGroup) Cleanup(sarama.ConsumerGroupSession) error {
-	return nil
-}
-
-// ConsumeClaim processes messages from a partition claim.
-// Uses a drain-then-flush pattern: processes all immediately available messages,
-// then flushes. This naturally batches messages that arrived together (e.g., from
-// a batch publish) without requiring a configured batch size or timer.
-func (c *ConsumerGroup) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+// handleClaim processes messages from a single claim with the drain-then-flush
+// pattern. defer flush() runs when the claim ends (shutdown or rebalance), so
+// accumulated state never leaks across a rebalance boundary.
+func (c *ConsumerGroup) handleClaim(claim Claim) error {
 	defer c.flush()
 	for {
 		select {
@@ -113,45 +92,48 @@ func (c *ConsumerGroup) ConsumeClaim(session sarama.ConsumerGroupSession, claim 
 			if !ok {
 				return nil
 			}
-			c.processOne(session, msg)
+			c.processOne(claim, msg)
 
-			// Drain all immediately-ready messages before flushing
+			// Drain all immediately-ready messages before flushing. Messages
+			// that arrived as a batch publish naturally cluster here, so batch
+			// size matches producer intent without requiring a timer.
 			for {
 				select {
 				case msg, ok := <-claim.Messages():
 					if !ok {
 						return nil
 					}
-					c.processOne(session, msg)
+					c.processOne(claim, msg)
 				default:
-					goto drain_done
+					goto drainDone
 				}
 			}
-		drain_done:
+		drainDone:
 			c.flush()
 
-		case <-session.Context().Done():
+		case <-claim.Context().Done():
 			return nil
 		}
 	}
 }
 
-func (c *ConsumerGroup) processOne(session sarama.ConsumerGroupSession, msg *sarama.ConsumerMessage) {
-	if err := c.processWithRetry(session.Context(), msg); err != nil {
+func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
+	if err := c.processWithRetry(claim.Context(), msg); err != nil {
 		c.sendToDLQ(msg, err)
 	}
-	session.MarkMessage(msg, "")
+	claim.MarkMessage(msg)
 }
 
 func (c *ConsumerGroup) flush() {
-	if c.flushFunc != nil {
-		if err := c.flushFunc(); err != nil {
-			c.logger.Error("flush failed", zap.Error(err))
-		}
+	if c.flushFunc == nil {
+		return
+	}
+	if err := c.flushFunc(); err != nil {
+		c.logger.Error("flush failed", zap.Error(err))
 	}
 }
 
-func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *sarama.ConsumerMessage) error {
+func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *Message) error {
 	var lastErr error
 	for attempt := 0; attempt < c.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -178,40 +160,42 @@ func (c *ConsumerGroup) processWithRetry(ctx context.Context, msg *sarama.Consum
 	return lastErr
 }
 
-func (c *ConsumerGroup) sendToDLQ(msg *sarama.ConsumerMessage, processErr error) {
+// sendToDLQ publishes the failed message envelope to <topic>.dlq via the
+// Broker. Routing through Broker (not the sync Sarama producer) keeps DLQ
+// working in standalone mode where there's no Sarama at all.
+func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) {
+	if c.producer == nil {
+		c.logger.Error("no producer configured for DLQ — dropping failed message",
+			zap.String("topic", msg.Topic),
+			zap.Int64("offset", msg.Offset),
+		)
+		return
+	}
 	dlqTopic := DLQTopic(msg.Topic)
 	dlqMsg := map[string]any{
-		"original_topic":  msg.Topic,
-		"original_key":    string(msg.Key),
-		"original_value":  string(msg.Value),
-		"error":           processErr.Error(),
-		"partition":       msg.Partition,
-		"offset":          msg.Offset,
+		"original_topic": msg.Topic,
+		"original_key":   string(msg.Key),
+		"original_value": string(msg.Value),
+		"error":          processErr.Error(),
+		"partition":      msg.Partition,
+		"offset":         msg.Offset,
 	}
-
 	data, err := json.Marshal(dlqMsg)
 	if err != nil {
 		c.logger.Error("failed to marshal DLQ message", zap.Error(err))
 		return
 	}
-
-	dlqProducerMsg := &sarama.ProducerMessage{
-		Topic: dlqTopic,
-		Key:   sarama.ByteEncoder(msg.Key),
-		Value: sarama.ByteEncoder(data),
-	}
-
-	if _, _, err := c.producer.syncProducer.SendMessage(dlqProducerMsg); err != nil {
+	if err := c.producer.SendRaw(dlqTopic, string(msg.Key), data); err != nil {
 		c.logger.Error("failed to send to DLQ",
 			zap.String("dlq_topic", dlqTopic),
 			zap.Error(err),
 		)
-	} else {
-		c.logger.Info("message sent to DLQ",
-			zap.String("dlq_topic", dlqTopic),
-			zap.String("original_topic", msg.Topic),
-			zap.Int32("partition", msg.Partition),
-			zap.Int64("offset", msg.Offset),
-		)
+		return
 	}
+	c.logger.Info("message sent to DLQ",
+		zap.String("dlq_topic", dlqTopic),
+		zap.String("original_topic", msg.Topic),
+		zap.Int32("partition", msg.Partition),
+		zap.Int64("offset", msg.Offset),
+	)
 }

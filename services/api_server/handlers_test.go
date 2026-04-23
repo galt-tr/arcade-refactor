@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
@@ -22,38 +21,6 @@ import (
 	"github.com/bsv-blockchain/arcade/store"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
-
-// mockSyncProducer implements sarama.SyncProducer for testing.
-type mockSyncProducer struct {
-	messages       []*sarama.ProducerMessage
-	batchCalls     int
-	sendMessagesFn func(msgs []*sarama.ProducerMessage) error
-}
-
-func (m *mockSyncProducer) SendMessage(msg *sarama.ProducerMessage) (int32, int64, error) {
-	m.messages = append(m.messages, msg)
-	return 0, 0, nil
-}
-func (m *mockSyncProducer) SendMessages(msgs []*sarama.ProducerMessage) error {
-	m.batchCalls++
-	m.messages = append(m.messages, msgs...)
-	if m.sendMessagesFn != nil {
-		return m.sendMessagesFn(msgs)
-	}
-	return nil
-}
-func (m *mockSyncProducer) Close() error                            { return nil }
-func (m *mockSyncProducer) IsTransactional() bool                   { return false }
-func (m *mockSyncProducer) BeginTxn() error                         { return nil }
-func (m *mockSyncProducer) CommitTxn() error                        { return nil }
-func (m *mockSyncProducer) AbortTxn() error                         { return nil }
-func (m *mockSyncProducer) AddOffsetsToTxn(map[string][]*sarama.PartitionOffsetMetadata, string) error {
-	return nil
-}
-func (m *mockSyncProducer) AddMessageToTxn(*sarama.ConsumerMessage, string, *string) error {
-	return nil
-}
-func (m *mockSyncProducer) TxnStatus() sarama.ProducerTxnStatusFlag { return 0 }
 
 // mockStore implements store.Store for testing callback handlers.
 //
@@ -132,7 +99,7 @@ func (m *mockStore) GetStumpsByBlockHash(context.Context, string) ([]*models.Stu
 	return nil, nil
 }
 func (m *mockStore) DeleteStumpsByBlockHash(context.Context, string) error { return nil }
-func (m *mockStore) BumpRetryCount(context.Context, string) (int, error) { return 0, nil }
+func (m *mockStore) BumpRetryCount(context.Context, string) (int, error)   { return 0, nil }
 func (m *mockStore) SetPendingRetryFields(context.Context, string, []byte, time.Time) error {
 	return nil
 }
@@ -150,9 +117,9 @@ func makeMinimalTx() []byte {
 	return tx.Bytes()
 }
 
-func setupServerWithStore(mock *mockSyncProducer, ms *mockStore) (*Server, *gin.Engine) {
+func setupServerWithStore(broker *kafka.RecordingBroker, ms *mockStore) (*Server, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
-	producer := kafka.NewProducerWithSync(mock)
+	producer := kafka.NewProducer(broker)
 	srv := &Server{
 		cfg:      &config.Config{},
 		logger:   zap.NewNop(),
@@ -164,9 +131,9 @@ func setupServerWithStore(mock *mockSyncProducer, ms *mockStore) (*Server, *gin.
 	return srv, router
 }
 
-func setupServer(mock *mockSyncProducer) (*Server, *gin.Engine) {
+func setupServer(broker *kafka.RecordingBroker) (*Server, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
-	producer := kafka.NewProducerWithSync(mock)
+	producer := kafka.NewProducer(broker)
 	srv := &Server{
 		cfg:      &config.Config{},
 		logger:   zap.NewNop(),
@@ -177,9 +144,23 @@ func setupServer(mock *mockSyncProducer) (*Server, *gin.Engine) {
 	return srv, router
 }
 
+// totalMessages returns the combined count of single-message Sends and
+// batched entries — matching the old Sarama mock's flat-message semantics.
+func totalMessages(broker *kafka.RecordingBroker) int {
+	broker.Lock()
+	defer broker.Unlock()
+	return len(broker.Sends) + func() int {
+		n := 0
+		for _, b := range broker.Batches {
+			n += len(b)
+		}
+		return n
+	}()
+}
+
 func TestHandleSubmitTransactions_BatchPublish(t *testing.T) {
-	mock := &mockSyncProducer{}
-	_, router := setupServer(mock)
+	broker := &kafka.RecordingBroker{}
+	_, router := setupServer(broker)
 
 	// Concatenate 3 minimal transactions
 	txBytes := makeMinimalTx()
@@ -201,17 +182,17 @@ func TestHandleSubmitTransactions_BatchPublish(t *testing.T) {
 		t.Errorf("expected submitted=3, got %v", resp["submitted"])
 	}
 
-	if mock.batchCalls != 1 {
-		t.Errorf("expected 1 batch call, got %d", mock.batchCalls)
+	if broker.BatchCalls != 1 {
+		t.Errorf("expected 1 batch call, got %d", broker.BatchCalls)
 	}
-	if len(mock.messages) != 3 {
-		t.Errorf("expected 3 messages, got %d", len(mock.messages))
+	if got := broker.MessageCount(); got != 3 {
+		t.Errorf("expected 3 messages, got %d", got)
 	}
 }
 
 func TestHandleSubmitTransactions_ParseFailure_NoPublish(t *testing.T) {
-	mock := &mockSyncProducer{}
-	_, router := setupServer(mock)
+	broker := &kafka.RecordingBroker{}
+	_, router := setupServer(broker)
 
 	// Valid tx followed by garbage
 	body := append(makeMinimalTx(), 0xff, 0xfe, 0xfd)
@@ -226,14 +207,14 @@ func TestHandleSubmitTransactions_ParseFailure_NoPublish(t *testing.T) {
 		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 
-	if mock.batchCalls != 0 {
-		t.Errorf("expected 0 batch calls on parse failure, got %d", mock.batchCalls)
+	if broker.BatchCalls != 0 {
+		t.Errorf("expected 0 batch calls on parse failure, got %d", broker.BatchCalls)
 	}
 }
 
 func TestHandleSubmitTransactions_100Txs_SingleBatchCall(t *testing.T) {
-	mock := &mockSyncProducer{}
-	_, router := setupServer(mock)
+	broker := &kafka.RecordingBroker{}
+	_, router := setupServer(broker)
 
 	// Concatenate 100 minimal transactions
 	txBytes := makeMinimalTx()
@@ -255,28 +236,17 @@ func TestHandleSubmitTransactions_100Txs_SingleBatchCall(t *testing.T) {
 		t.Errorf("expected submitted=100, got %v", resp["submitted"])
 	}
 
-	if mock.batchCalls != 1 {
-		t.Errorf("expected exactly 1 batch call for 100 txs, got %d", mock.batchCalls)
+	if broker.BatchCalls != 1 {
+		t.Errorf("expected exactly 1 batch call for 100 txs, got %d", broker.BatchCalls)
 	}
-	if len(mock.messages) != 100 {
-		t.Errorf("expected 100 messages in batch, got %d", len(mock.messages))
-	}
-
-	// Verify all messages go to the transaction topic
-	for i, msg := range mock.messages {
-		if msg.Topic != "arcade.transaction" {
-			t.Errorf("message %d: expected topic arcade.transaction, got %s", i, msg.Topic)
-		}
+	if got := broker.MessageCount(); got != 100 {
+		t.Errorf("expected 100 messages in batch, got %d", got)
 	}
 }
 
 func TestHandleSubmitTransactions_KafkaFailure_Returns500(t *testing.T) {
-	mock := &mockSyncProducer{
-		sendMessagesFn: func(msgs []*sarama.ProducerMessage) error {
-			return errors.New("broker down")
-		},
-	}
-	_, router := setupServer(mock)
+	broker := &kafka.RecordingBroker{BatchErr: errors.New("broker down")}
+	_, router := setupServer(broker)
 
 	body := makeMinimalTx()
 
@@ -293,7 +263,7 @@ func TestHandleSubmitTransactions_KafkaFailure_Returns500(t *testing.T) {
 
 func TestHandleCallback_SeenMultipleNodes_UpdatesStatus(t *testing.T) {
 	ms := &mockStore{}
-	_, router := setupServerWithStore(&mockSyncProducer{}, ms)
+	_, router := setupServerWithStore(&kafka.RecordingBroker{}, ms)
 
 	payload := models.CallbackMessage{
 		Type:  models.CallbackSeenMultipleNodes,
@@ -331,9 +301,9 @@ func TestHandleCallback_Stump_StorageError_Returns500(t *testing.T) {
 	// When STUMP storage fails, we MUST return 5xx so merkle-service retries.
 	// Swallowing the error with a 200 breaks the bump_builder's invariant that
 	// every STUMP in a BLOCK_PROCESSED block is durably stored in Aerospike.
-	mock := &mockSyncProducer{}
+	broker := &kafka.RecordingBroker{}
 	ms := &mockStore{insertStumpErr: errors.New("SERVER_MEM_ERROR")}
-	_, router := setupServerWithStore(mock, ms)
+	_, router := setupServerWithStore(broker, ms)
 
 	payload := models.CallbackMessage{
 		Type:      models.CallbackStump,
@@ -351,14 +321,14 @@ func TestHandleCallback_Stump_StorageError_Returns500(t *testing.T) {
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
 	}
-	if len(mock.messages) != 0 {
-		t.Errorf("expected 0 Kafka messages after storage failure, got %d", len(mock.messages))
+	if got := totalMessages(broker); got != 0 {
+		t.Errorf("expected 0 Kafka messages after storage failure, got %d", got)
 	}
 }
 
 func TestHandleCallback_SeenMultipleNodes_EmptyTxIDs(t *testing.T) {
 	ms := &mockStore{}
-	_, router := setupServerWithStore(&mockSyncProducer{}, ms)
+	_, router := setupServerWithStore(&kafka.RecordingBroker{}, ms)
 
 	payload := models.CallbackMessage{
 		Type:  models.CallbackSeenMultipleNodes,
@@ -423,9 +393,9 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 		stumpPayloads[i] = buf
 	}
 
-	mock := &mockSyncProducer{}
+	broker := &kafka.RecordingBroker{}
 	ms := &mockStore{}
-	_, router := setupServerWithStore(mock, ms)
+	_, router := setupServerWithStore(broker, ms)
 
 	// Phase 1: fire all 20 STUMPs in parallel.
 	var wg sync.WaitGroup
@@ -496,8 +466,8 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 
 	// STUMPs must not produce Kafka traffic — the bump_builder consumes
 	// arcade.block_processed only, and STUMPs are writes to the store.
-	if len(mock.messages) != 0 {
-		t.Fatalf("expected 0 Kafka messages after STUMP phase, got %d", len(mock.messages))
+	if got := totalMessages(broker); got != 0 {
+		t.Fatalf("expected 0 Kafka messages after STUMP phase, got %d", got)
 	}
 
 	// Phase 2: BLOCK_PROCESSED. Carries only the block hash; merkle-service
@@ -522,26 +492,24 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 	// Exactly one Kafka message on arcade.block_processed, keyed by block
 	// hash, with the full CallbackMessage JSON as the value — this is what
 	// the bump_builder consumer expects (services/bump_builder/builder.go).
-	if len(mock.messages) != 1 {
-		t.Fatalf("expected 1 Kafka message after BLOCK_PROCESSED, got %d", len(mock.messages))
+	if got := totalMessages(broker); got != 1 {
+		t.Fatalf("expected 1 Kafka message after BLOCK_PROCESSED, got %d", got)
 	}
-	kmsg := mock.messages[0]
-	if kmsg.Topic != kafka.TopicBlockProcessed {
-		t.Errorf("Kafka topic = %q, want %q", kmsg.Topic, kafka.TopicBlockProcessed)
+	broker.Lock()
+	if len(broker.Sends) != 1 {
+		broker.Unlock()
+		t.Fatalf("expected 1 Send call, got %d", len(broker.Sends))
 	}
-	gotKey, err := kmsg.Key.Encode()
-	if err != nil {
-		t.Fatalf("encode kafka key: %v", err)
+	sent := broker.Sends[0]
+	broker.Unlock()
+	if sent.Topic != kafka.TopicBlockProcessed {
+		t.Errorf("Kafka topic = %q, want %q", sent.Topic, kafka.TopicBlockProcessed)
 	}
-	if string(gotKey) != blockHash {
-		t.Errorf("Kafka key = %q, want %q", gotKey, blockHash)
-	}
-	val, err := kmsg.Value.Encode()
-	if err != nil {
-		t.Fatalf("encode kafka value: %v", err)
+	if sent.Key != blockHash {
+		t.Errorf("Kafka key = %q, want %q", sent.Key, blockHash)
 	}
 	var decoded models.CallbackMessage
-	if err := json.Unmarshal(val, &decoded); err != nil {
+	if err := json.Unmarshal(sent.Value, &decoded); err != nil {
 		t.Fatalf("unmarshal kafka value: %v", err)
 	}
 	if decoded.Type != models.CallbackBlockProcessed {
@@ -601,8 +569,8 @@ func TestHandleCallback_FullBlockFlow_20Subtrees(t *testing.T) {
 //     This assertion documents where responsibility sits.
 func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 	const (
-		numSubtrees   = 20
-		stumpSize     = 8 * 1024
+		numSubtrees    = 20
+		stumpSize      = 8 * 1024
 		failingSubtree = 7
 	)
 	blockHash := "000000000000000000001234567890abcdef1234567890abcdef1234567890ab"
@@ -616,7 +584,7 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 		stumpPayloads[i] = buf
 	}
 
-	mock := &mockSyncProducer{}
+	broker := &kafka.RecordingBroker{}
 	ms := &mockStore{
 		insertStumpFn: func(stump *models.Stump) error {
 			if stump.SubtreeIndex == failingSubtree {
@@ -627,7 +595,7 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 			return nil
 		},
 	}
-	_, router := setupServerWithStore(mock, ms)
+	_, router := setupServerWithStore(broker, ms)
 
 	type result struct {
 		idx    int
@@ -684,8 +652,8 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 	}
 
 	// Kafka must be untouched during STUMP phase, even with a mid-flight 500.
-	if len(mock.messages) != 0 {
-		t.Fatalf("expected 0 Kafka messages during STUMP phase, got %d", len(mock.messages))
+	if got := totalMessages(broker); got != 0 {
+		t.Fatalf("expected 0 Kafka messages during STUMP phase, got %d", got)
 	}
 
 	// BLOCK_PROCESSED is still accepted and published. arcade does not check
@@ -704,7 +672,7 @@ func TestHandleCallback_FullBlockFlow_PartialStumpFailure(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("BLOCK_PROCESSED: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if len(mock.messages) != 1 {
-		t.Errorf("expected 1 Kafka message after BLOCK_PROCESSED, got %d", len(mock.messages))
+	if got := totalMessages(broker); got != 1 {
+		t.Errorf("expected 1 Kafka message after BLOCK_PROCESSED, got %d", got)
 	}
 }

@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/IBM/sarama"
 	"go.uber.org/zap"
 
 	"github.com/bsv-blockchain/arcade/config"
@@ -130,7 +129,7 @@ func (p *Propagator) Name() string { return "propagation" }
 
 func (p *Propagator) Start(ctx context.Context) error {
 	consumer, err := kafka.NewConsumerGroup(kafka.ConsumerConfig{
-		Brokers:    p.cfg.Kafka.Brokers,
+		Broker:     p.producer.Broker(),
 		GroupID:    p.cfg.Kafka.ConsumerGroup + "-propagation",
 		Topics:     []string{kafka.TopicPropagation},
 		Handler:    p.handleMessage,
@@ -168,7 +167,7 @@ func (p *Propagator) Stop() error {
 // The consumer's drain-then-flush pattern calls flushBatch after all immediately
 // available messages have been processed, so the batch size naturally matches
 // what the client submitted — no configured threshold needed.
-func (p *Propagator) handleMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
+func (p *Propagator) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	var propMsg propagationMsg
 	if err := json.Unmarshal(msg.Value, &propMsg); err != nil {
 		return fmt.Errorf("unmarshaling propagation message: %w", err)
