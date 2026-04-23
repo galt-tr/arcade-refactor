@@ -1,4 +1,4 @@
-package store
+package aerospike
 
 import (
 	"context"
@@ -17,6 +17,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/models"
+	"github.com/bsv-blockchain/arcade/store"
 )
 
 func isKeyNotFound(err error) bool {
@@ -32,11 +33,12 @@ const (
 	setLeases         = "leases"
 )
 
-// Ensure AerospikeStore implements Store and Leaser
-var _ Store = (*AerospikeStore)(nil)
-var _ Leaser = (*AerospikeStore)(nil)
+// Ensure Store implements the store interfaces.
+var _ store.Store = (*Store)(nil)
+var _ store.Leaser = (*Store)(nil)
 
-type AerospikeStore struct {
+// Store is the Aerospike-backed implementation of store.Store and store.Leaser.
+type Store struct {
 	client         *aero.Client
 	namespace      string
 	batchSize      int
@@ -45,7 +47,8 @@ type AerospikeStore struct {
 	socketTimeout  time.Duration
 }
 
-func NewAerospikeStore(cfg config.Aero) (*AerospikeStore, error) {
+// New creates an Aerospike-backed Store connected to the configured cluster.
+func New(cfg config.Aero) (*Store, error) {
 	hosts := make([]*aero.Host, 0, len(cfg.Hosts))
 	for _, h := range cfg.Hosts {
 		hostname, portStr, err := net.SplitHostPort(h)
@@ -69,7 +72,7 @@ func NewAerospikeStore(cfg config.Aero) (*AerospikeStore, error) {
 		return nil, fmt.Errorf("connecting to aerospike: %w", err)
 	}
 
-	s := &AerospikeStore{
+	s := &Store{
 		client:        client,
 		namespace:     cfg.Namespace,
 		batchSize:     cfg.BatchSize,
@@ -86,16 +89,16 @@ func NewAerospikeStore(cfg config.Aero) (*AerospikeStore, error) {
 	return s, nil
 }
 
-func (s *AerospikeStore) Healthy() bool {
+func (s *Store) Healthy() bool {
 	return s.client.IsConnected()
 }
 
-func (s *AerospikeStore) Close() error {
+func (s *Store) Close() error {
 	s.client.Close()
 	return nil
 }
 
-func (s *AerospikeStore) EnsureIndexes() error {
+func (s *Store) EnsureIndexes() error {
 	indexes := []struct {
 		set, bin, name string
 		indexType      aero.IndexType
@@ -136,7 +139,7 @@ func (s *AerospikeStore) EnsureIndexes() error {
 	return nil
 }
 
-func (s *AerospikeStore) key(set string, pk string) (*aero.Key, error) {
+func (s *Store) key(set string, pk string) (*aero.Key, error) {
 	return aero.NewKey(s.namespace, set, pk)
 }
 
@@ -165,7 +168,7 @@ func remaining(ctx context.Context, def time.Duration) time.Duration {
 // queryPolicy builds a QueryPolicy whose TotalTimeout tracks ctx deadline,
 // capped by the configured query timeout. MaxRetries is kept low so a
 // failing query can't hog a connection across many server-side retries.
-func (s *AerospikeStore) queryPolicy(ctx context.Context) *aero.QueryPolicy {
+func (s *Store) queryPolicy(ctx context.Context) *aero.QueryPolicy {
 	p := aero.NewQueryPolicy()
 	p.TotalTimeout = remaining(ctx, s.queryTimeout)
 	p.SocketTimeout = s.socketTimeout
@@ -174,7 +177,7 @@ func (s *AerospikeStore) queryPolicy(ctx context.Context) *aero.QueryPolicy {
 }
 
 // readPolicy builds a BasePolicy for single-record reads.
-func (s *AerospikeStore) readPolicy(ctx context.Context) *aero.BasePolicy {
+func (s *Store) readPolicy(ctx context.Context) *aero.BasePolicy {
 	p := aero.NewPolicy()
 	p.TotalTimeout = remaining(ctx, s.opTimeout)
 	p.SocketTimeout = s.socketTimeout
@@ -185,7 +188,7 @@ func (s *AerospikeStore) readPolicy(ctx context.Context) *aero.BasePolicy {
 // writePolicy builds a WritePolicy for single-record writes. Callers can
 // mutate RecordExistsAction, Expiration, GenerationPolicy, etc. on the
 // returned struct.
-func (s *AerospikeStore) writePolicy(ctx context.Context) *aero.WritePolicy {
+func (s *Store) writePolicy(ctx context.Context) *aero.WritePolicy {
 	p := aero.NewWritePolicy(0, 0)
 	p.TotalTimeout = remaining(ctx, s.opTimeout)
 	p.SocketTimeout = s.socketTimeout
@@ -195,7 +198,7 @@ func (s *AerospikeStore) writePolicy(ctx context.Context) *aero.WritePolicy {
 
 // batchPolicy builds a BatchPolicy for multi-record operations. Retries are
 // kept low because batch failures amplify connection pressure.
-func (s *AerospikeStore) batchPolicy(ctx context.Context) *aero.BatchPolicy {
+func (s *Store) batchPolicy(ctx context.Context) *aero.BatchPolicy {
 	p := aero.NewBatchPolicy()
 	p.TotalTimeout = remaining(ctx, s.opTimeout)
 	p.SocketTimeout = s.socketTimeout
@@ -205,7 +208,7 @@ func (s *AerospikeStore) batchPolicy(ctx context.Context) *aero.BatchPolicy {
 
 // --- Transaction Status Operations ---
 
-func (s *AerospikeStore) GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {
 		return nil, false, err
@@ -257,7 +260,7 @@ func (s *AerospikeStore) GetOrInsertStatus(ctx context.Context, status *models.T
 	return status, true, nil
 }
 
-func (s *AerospikeStore) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
+func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {
 		return err
@@ -283,7 +286,7 @@ func (s *AerospikeStore) UpdateStatus(ctx context.Context, status *models.Transa
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
-func (s *AerospikeStore) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
+func (s *Store) GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error) {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return nil, err
@@ -302,7 +305,7 @@ func (s *AerospikeStore) GetStatus(ctx context.Context, txid string) (*models.Tr
 	return status, nil
 }
 
-func (s *AerospikeStore) GetStatusesSince(ctx context.Context, _ time.Time) ([]*models.TransactionStatus, error) {
+func (s *Store) GetStatusesSince(ctx context.Context, _ time.Time) ([]*models.TransactionStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -344,7 +347,7 @@ loop:
 	return results, nil
 }
 
-func (s *AerospikeStore) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
+func (s *Store) SetStatusByBlockHash(ctx context.Context, blockHash string, newStatus models.Status) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -401,7 +404,7 @@ loop:
 // Bin writes for status / raw_tx / next_retry_at are handled separately by
 // SetPendingRetryFields so callers can compute the correct backoff from the
 // post-increment count.
-func (s *AerospikeStore) BumpRetryCount(ctx context.Context, txid string) (int, error) {
+func (s *Store) BumpRetryCount(ctx context.Context, txid string) (int, error) {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return 0, err
@@ -425,7 +428,7 @@ func (s *AerospikeStore) BumpRetryCount(ctx context.Context, txid string) (int, 
 // SetPendingRetryFields writes the durable retry bins in one atomic call. The
 // caller is responsible for having already bumped retry_count and computed
 // next_retry_at from that post-increment value.
-func (s *AerospikeStore) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
+func (s *Store) SetPendingRetryFields(ctx context.Context, txid string, rawTx []byte, nextRetryAt time.Time) error {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return err
@@ -445,7 +448,7 @@ func (s *AerospikeStore) SetPendingRetryFields(ctx context.Context, txid string,
 // GetReadyRetries uses the existing idx_tx_status index to find PENDING_RETRY
 // rows and filters by next_retry_at in code. At expected cardinality
 // (thousands, not millions) this is cheap.
-func (s *AerospikeStore) GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*PendingRetry, error) {
+func (s *Store) GetReadyRetries(ctx context.Context, now time.Time, limit int) ([]*store.PendingRetry, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -464,7 +467,7 @@ func (s *AerospikeStore) GetReadyRetries(ctx context.Context, now time.Time, lim
 	}
 
 	nowMs := now.UnixMilli()
-	results := make([]*PendingRetry, 0, limit)
+	results := make([]*store.PendingRetry, 0, limit)
 	var loopErr error
 loop:
 	for {
@@ -489,7 +492,7 @@ loop:
 				// Legacy PENDING_RETRY rows from before durable retries — skip.
 				continue
 			}
-			results = append(results, &PendingRetry{
+			results = append(results, &store.PendingRetry{
 				TxID:        getString(rec.Record, "txid"),
 				RawTx:       rawTx,
 				RetryCount:  getInt(rec.Record, "retry_count"),
@@ -509,7 +512,7 @@ loop:
 // ClearRetryState transitions a tx out of PENDING_RETRY and deletes the retry
 // bins so the row stops matching the reaper's query. retry_count is retained
 // for observability.
-func (s *AerospikeStore) ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error {
+func (s *Store) ClearRetryState(ctx context.Context, txid string, finalStatus models.Status, extraInfo string) error {
 	key, err := s.key(setTransactions, txid)
 	if err != nil {
 		return err
@@ -530,7 +533,7 @@ func (s *AerospikeStore) ClearRetryState(ctx context.Context, txid string, final
 	return nil
 }
 
-func (s *AerospikeStore) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
+func (s *Store) SetMinedByTxIDs(ctx context.Context, blockHash string, txids []string) ([]*models.TransactionStatus, error) {
 	now := time.Now()
 	var statuses []*models.TransactionStatus
 
@@ -582,7 +585,7 @@ func (s *AerospikeStore) SetMinedByTxIDs(ctx context.Context, blockHash string, 
 
 // --- BUMP Operations ---
 
-func (s *AerospikeStore) InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error {
+func (s *Store) InsertBUMP(ctx context.Context, blockHash string, blockHeight uint64, bumpData []byte) error {
 	key, err := s.key(setBumps, blockHash)
 	if err != nil {
 		return err
@@ -595,7 +598,7 @@ func (s *AerospikeStore) InsertBUMP(ctx context.Context, blockHash string, block
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
-func (s *AerospikeStore) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, error) {
+func (s *Store) GetBUMP(ctx context.Context, blockHash string) (uint64, []byte, error) {
 	key, err := s.key(setBumps, blockHash)
 	if err != nil {
 		return 0, nil, err
@@ -605,7 +608,7 @@ func (s *AerospikeStore) GetBUMP(ctx context.Context, blockHash string) (uint64,
 		return 0, nil, fmt.Errorf("get bump %s: %w", blockHash, err)
 	}
 	if rec == nil {
-		return 0, nil, ErrNotFound
+		return 0, nil, store.ErrNotFound
 	}
 
 	var height uint64
@@ -625,7 +628,7 @@ func (s *AerospikeStore) GetBUMP(ctx context.Context, blockHash string) (uint64,
 
 // --- STUMP Operations (keyed by blockHash:subtreeIndex) ---
 
-func (s *AerospikeStore) InsertStump(ctx context.Context, stump *models.Stump) error {
+func (s *Store) InsertStump(ctx context.Context, stump *models.Stump) error {
 	pk := fmt.Sprintf("%s:%d", stump.BlockHash, stump.SubtreeIndex)
 	key, err := s.key(setStumps, pk)
 	if err != nil {
@@ -639,7 +642,7 @@ func (s *AerospikeStore) InsertStump(ctx context.Context, stump *models.Stump) e
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
-func (s *AerospikeStore) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error) {
+func (s *Store) GetStumpsByBlockHash(ctx context.Context, blockHash string) ([]*models.Stump, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -694,7 +697,7 @@ loop:
 	return stumps, nil
 }
 
-func (s *AerospikeStore) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error {
+func (s *Store) DeleteStumpsByBlockHash(ctx context.Context, blockHash string) error {
 	stumps, err := s.GetStumpsByBlockHash(ctx, blockHash)
 	if err != nil {
 		return err
@@ -729,7 +732,7 @@ func (s *AerospikeStore) DeleteStumpsByBlockHash(ctx context.Context, blockHash 
 
 // --- Submission Operations ---
 
-func (s *AerospikeStore) InsertSubmission(ctx context.Context, sub *models.Submission) error {
+func (s *Store) InsertSubmission(ctx context.Context, sub *models.Submission) error {
 	key, err := s.key(setSubmissions, sub.SubmissionID)
 	if err != nil {
 		return err
@@ -745,7 +748,7 @@ func (s *AerospikeStore) InsertSubmission(ctx context.Context, sub *models.Submi
 	return s.client.Put(s.writePolicy(ctx), key, bins)
 }
 
-func (s *AerospikeStore) GetSubmissionsByTxID(ctx context.Context, txid string) ([]*models.Submission, error) {
+func (s *Store) GetSubmissionsByTxID(ctx context.Context, txid string) ([]*models.Submission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -786,7 +789,7 @@ loop:
 	return subs, nil
 }
 
-func (s *AerospikeStore) GetSubmissionsByToken(ctx context.Context, token string) ([]*models.Submission, error) {
+func (s *Store) GetSubmissionsByToken(ctx context.Context, token string) ([]*models.Submission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -827,7 +830,7 @@ loop:
 	return subs, nil
 }
 
-func (s *AerospikeStore) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
+func (s *Store) UpdateDeliveryStatus(ctx context.Context, submissionID string, lastStatus models.Status, retryCount int, nextRetry *time.Time) error {
 	key, err := s.key(setSubmissions, submissionID)
 	if err != nil {
 		return err
@@ -844,7 +847,7 @@ func (s *AerospikeStore) UpdateDeliveryStatus(ctx context.Context, submissionID 
 
 // --- Block Tracking Operations ---
 
-func (s *AerospikeStore) HasAnyProcessedBlocks(ctx context.Context) (bool, error) {
+func (s *Store) HasAnyProcessedBlocks(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -883,7 +886,7 @@ loop:
 	return found, nil
 }
 
-func (s *AerospikeStore) GetOnChainBlockAtHeight(ctx context.Context, height uint64) (string, bool, error) {
+func (s *Store) GetOnChainBlockAtHeight(ctx context.Context, height uint64) (string, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
@@ -931,7 +934,7 @@ loop:
 	return blockHash, onChain, nil
 }
 
-func (s *AerospikeStore) MarkBlockOffChain(ctx context.Context, blockHash string) error {
+func (s *Store) MarkBlockOffChain(ctx context.Context, blockHash string) error {
 	key, err := s.key(setProcessedBlocks, blockHash)
 	if err != nil {
 		return err
@@ -991,7 +994,7 @@ func recordToStatus(rec *aero.Record, txid string) *models.TransactionStatus {
 
 // enrichMerklePath fetches the compound BUMP for a mined/immutable transaction
 // and extracts the per-tx minimal merkle path if not already present.
-func (s *AerospikeStore) enrichMerklePath(ctx context.Context, status *models.TransactionStatus) {
+func (s *Store) enrichMerklePath(ctx context.Context, status *models.TransactionStatus) {
 	if status == nil || len(status.MerklePath) > 0 || status.BlockHash == "" {
 		return
 	}
@@ -1104,7 +1107,7 @@ func recordToSubmission(rec *aero.Record) *models.Submission {
 // native TTL as the authoritative expiration (no client clock dependency). The
 // expires_at bin is a belt-and-braces hint for the narrow window between TTL
 // lapse and next client scan.
-func (s *AerospikeStore) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
+func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
 	key, err := s.key(setLeases, name)
 	if err != nil {
 		return time.Time{}, err
@@ -1158,7 +1161,7 @@ func (s *AerospikeStore) TryAcquireOrRenew(ctx context.Context, name, holder str
 // Release deletes a lease record if it's still held by this caller. Gen-match
 // prevents us from stepping on a successor who has already acquired it after
 // our TTL lapsed. Swallows benign races (not held / raced to delete) as nil.
-func (s *AerospikeStore) Release(ctx context.Context, name, holder string) error {
+func (s *Store) Release(ctx context.Context, name, holder string) error {
 	key, err := s.key(setLeases, name)
 	if err != nil {
 		return err

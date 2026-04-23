@@ -1,4 +1,4 @@
-package store
+package aerospike
 
 import (
 	"context"
@@ -50,7 +50,7 @@ func TestRemaining(t *testing.T) {
 }
 
 func TestPolicyBuilders(t *testing.T) {
-	s := &AerospikeStore{
+	s := &Store{
 		queryTimeout:  8 * time.Second,
 		opTimeout:     3 * time.Second,
 		socketTimeout: 5 * time.Second,

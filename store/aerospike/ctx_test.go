@@ -1,6 +1,6 @@
 //go:build integration
 
-package store
+package aerospike
 
 import (
 	"context"
@@ -15,9 +15,9 @@ import (
 //
 //	go test -tags=integration ./store/...
 
-func integrationStore(t *testing.T) *AerospikeStore {
+func integrationStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := NewAerospikeStore(config.Aero{
+	s, err := New(config.Aero{
 		Hosts:           []string{"localhost:3200"},
 		Namespace:       "arcade",
 		BatchSize:       100,

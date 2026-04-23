@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/arcade/services/propagation"
 	"github.com/bsv-blockchain/arcade/services/tx_validator"
 	"github.com/bsv-blockchain/arcade/store"
+	storefactory "github.com/bsv-blockchain/arcade/store/factory"
 	"github.com/bsv-blockchain/arcade/teranode"
 	"github.com/bsv-blockchain/arcade/validator"
 )
@@ -52,6 +53,7 @@ func run(cmd *cobra.Command, _ []string) error {
 	logger.Info("starting arcade",
 		zap.String("mode", cfg.Mode),
 		zap.String("kafka_backend", cfg.Kafka.Backend),
+		zap.String("store_backend", cfg.Store.Backend),
 	)
 
 	broker, err := kafka.NewBroker(cfg.Kafka)
@@ -61,11 +63,14 @@ func run(cmd *cobra.Command, _ []string) error {
 	producer := kafka.NewProducer(broker)
 	defer producer.Close()
 
-	aeroStore, err := store.NewAerospikeStore(cfg.Aerospike)
+	st, leaser, err := storefactory.New(cfg)
 	if err != nil {
-		return fmt.Errorf("connecting to aerospike: %w", err)
+		return fmt.Errorf("creating store: %w", err)
 	}
-	defer aeroStore.Close()
+	defer st.Close()
+	if err := st.EnsureIndexes(); err != nil {
+		return fmt.Errorf("ensuring store indexes: %w", err)
+	}
 
 	// Create shared components
 	txTracker := store.NewTxTracker()
@@ -80,7 +85,7 @@ func run(cmd *cobra.Command, _ []string) error {
 
 	txVal := validator.NewValidator(nil, nil) // Default policy, no chain tracker yet
 
-	svcs := buildServices(cfg, logger, producer, aeroStore, txTracker, teranodeClient, merkleClient, txVal)
+	svcs := buildServices(cfg, logger, producer, st, leaser, txTracker, teranodeClient, merkleClient, txVal)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -134,7 +139,8 @@ func buildServices(
 	cfg *config.Config,
 	logger *zap.Logger,
 	producer *kafka.Producer,
-	aeroStore *store.AerospikeStore,
+	st store.Store,
+	leaser store.Leaser,
 	txTracker *store.TxTracker,
 	teranodeClient *teranode.Client,
 	merkleClient *merkleservice.Client,
@@ -147,18 +153,16 @@ func buildServices(
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, logger, producer, aeroStore, txTracker))
+		svcs = append(svcs, api_server.New(cfg, logger, producer, st, txTracker))
 	}
 	if shouldRun("bump-builder") {
-		svcs = append(svcs, bump_builder.New(cfg, logger, producer, aeroStore))
+		svcs = append(svcs, bump_builder.New(cfg, logger, producer, st))
 	}
 	if shouldRun("tx-validator") {
-		svcs = append(svcs, tx_validator.New(cfg, logger, producer, aeroStore, txTracker, txVal))
+		svcs = append(svcs, tx_validator.New(cfg, logger, producer, st, txTracker, txVal))
 	}
 	if shouldRun("propagation") {
-		// aeroStore satisfies both store.Store and store.Leaser; pass it twice
-		// so a future backend can be split across the two interfaces.
-		svcs = append(svcs, propagation.New(cfg, logger, producer, aeroStore, aeroStore, teranodeClient, merkleClient))
+		svcs = append(svcs, propagation.New(cfg, logger, producer, st, leaser, teranodeClient, merkleClient))
 	}
 
 	return svcs

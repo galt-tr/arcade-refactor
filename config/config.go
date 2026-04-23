@@ -17,7 +17,7 @@ type Config struct {
 	StoragePath   string              `mapstructure:"storage_path"`
 	APIServer     API                 `mapstructure:"api"`
 	Kafka         Kafka               `mapstructure:"kafka"`
-	Aerospike     Aero                `mapstructure:"aerospike"`
+	Store         Store               `mapstructure:"store"`
 	DatahubURLs   []string            `mapstructure:"datahub_urls"`
 	Teranode      TeranodeConfig      `mapstructure:"teranode"`
 	MerkleService MerkleServiceConfig `mapstructure:"merkle_service"`
@@ -57,6 +57,15 @@ type Kafka struct {
 	BufferSize    int      `mapstructure:"buffer_size"`
 }
 
+// Store picks the persistence backend. Backend dispatches construction in
+// store.New; Aerospike/Pebble sub-blocks are read only when their backend is
+// selected so operators don't need to fill in unused sections.
+type Store struct {
+	Backend   string `mapstructure:"backend"` // "aerospike" (default) or "pebble"
+	Aerospike Aero   `mapstructure:"aerospike"`
+	Pebble    Pebble `mapstructure:"pebble"`
+}
+
 type Aero struct {
 	Hosts           []string `mapstructure:"hosts"`
 	Namespace       string   `mapstructure:"namespace"`
@@ -65,6 +74,19 @@ type Aero struct {
 	QueryTimeoutMs  int      `mapstructure:"query_timeout_ms"`
 	OpTimeoutMs     int      `mapstructure:"op_timeout_ms"`
 	SocketTimeoutMs int      `mapstructure:"socket_timeout_ms"`
+}
+
+// Pebble configures the embedded Pebble KV backend. Path is the data directory
+// (Pebble takes an exclusive file lock, so single-process only). MemTableSizeMB
+// and L0CompactionThreshold are the two knobs operators usually want to tune;
+// the rest of Pebble's defaults are fine for arcade's workload. SyncWrites trades
+// durability of the last handful of writes for a ~10x throughput improvement —
+// acceptable for standalone since the reaper will re-send unacked transactions.
+type Pebble struct {
+	Path                  string `mapstructure:"path"`
+	MemTableSizeMB        int    `mapstructure:"memtable_size_mb"`
+	L0CompactionThreshold int    `mapstructure:"l0_compaction_threshold"`
+	SyncWrites            bool   `mapstructure:"sync_writes"`
 }
 
 type TeranodeConfig struct {
@@ -161,13 +183,18 @@ func setDefaults() {
 	viper.SetDefault("kafka.consumer_group", "arcade")
 	viper.SetDefault("kafka.max_retries", 5)
 	viper.SetDefault("kafka.buffer_size", 10000)
-	viper.SetDefault("aerospike.hosts", []string{"localhost:3000"})
-	viper.SetDefault("aerospike.namespace", "arcade")
-	viper.SetDefault("aerospike.batch_size", 500)
-	viper.SetDefault("aerospike.pool_size", 256)
-	viper.SetDefault("aerospike.query_timeout_ms", 8000)
-	viper.SetDefault("aerospike.op_timeout_ms", 3000)
-	viper.SetDefault("aerospike.socket_timeout_ms", 5000)
+	viper.SetDefault("store.backend", "aerospike")
+	viper.SetDefault("store.aerospike.hosts", []string{"localhost:3000"})
+	viper.SetDefault("store.aerospike.namespace", "arcade")
+	viper.SetDefault("store.aerospike.batch_size", 500)
+	viper.SetDefault("store.aerospike.pool_size", 256)
+	viper.SetDefault("store.aerospike.query_timeout_ms", 8000)
+	viper.SetDefault("store.aerospike.op_timeout_ms", 3000)
+	viper.SetDefault("store.aerospike.socket_timeout_ms", 5000)
+	viper.SetDefault("store.pebble.path", "~/.arcade/pebble")
+	viper.SetDefault("store.pebble.memtable_size_mb", 64)
+	viper.SetDefault("store.pebble.l0_compaction_threshold", 4)
+	viper.SetDefault("store.pebble.sync_writes", false)
 	viper.SetDefault("health.port", 8081)
 	viper.SetDefault("propagation.merkle_concurrency", 10)
 	viper.SetDefault("propagation.retry_max_attempts", 5)
@@ -199,8 +226,17 @@ func validate(cfg *Config) error {
 	default:
 		return fmt.Errorf("unknown kafka.backend %q (expected sarama or memory)", cfg.Kafka.Backend)
 	}
-	if len(cfg.Aerospike.Hosts) == 0 {
-		return fmt.Errorf("aerospike.hosts is required")
+	switch cfg.Store.Backend {
+	case "", "aerospike":
+		if len(cfg.Store.Aerospike.Hosts) == 0 {
+			return fmt.Errorf("store.aerospike.hosts is required when store.backend=aerospike")
+		}
+	case "pebble":
+		if cfg.Store.Pebble.Path == "" {
+			return fmt.Errorf("store.pebble.path is required when store.backend=pebble")
+		}
+	default:
+		return fmt.Errorf("unknown store.backend %q (expected aerospike or pebble)", cfg.Store.Backend)
 	}
 	validModes := map[string]bool{
 		"all": true, "api-server": true,
