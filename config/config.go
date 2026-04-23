@@ -58,12 +58,13 @@ type Kafka struct {
 }
 
 // Store picks the persistence backend. Backend dispatches construction in
-// store.New; Aerospike/Pebble sub-blocks are read only when their backend is
-// selected so operators don't need to fill in unused sections.
+// storefactory.New; sub-blocks are read only when their backend is selected
+// so operators don't need to fill in unused sections.
 type Store struct {
-	Backend   string `mapstructure:"backend"` // "aerospike" (default) or "pebble"
-	Aerospike Aero   `mapstructure:"aerospike"`
-	Pebble    Pebble `mapstructure:"pebble"`
+	Backend   string   `mapstructure:"backend"` // "aerospike" (default), "pebble", or "postgres"
+	Aerospike Aero     `mapstructure:"aerospike"`
+	Pebble    Pebble   `mapstructure:"pebble"`
+	Postgres  Postgres `mapstructure:"postgres"`
 }
 
 type Aero struct {
@@ -74,6 +75,24 @@ type Aero struct {
 	QueryTimeoutMs  int      `mapstructure:"query_timeout_ms"`
 	OpTimeoutMs     int      `mapstructure:"op_timeout_ms"`
 	SocketTimeoutMs int      `mapstructure:"socket_timeout_ms"`
+}
+
+// Postgres configures the Postgres-backed store. Embedded=true spins up
+// fergusstrange/embedded-postgres on Start, extracting the bundled Postgres
+// binary into EmbeddedCacheDir on first run — so the binary is a one-time
+// download, not per-start. DSN is used verbatim when Embedded=false; when
+// Embedded=true it's constructed from EmbeddedPort/EmbeddedUser/EmbeddedPass
+// and the standalone DataDir.
+type Postgres struct {
+	DSN              string `mapstructure:"dsn"`
+	Embedded         bool   `mapstructure:"embedded"`
+	EmbeddedPort     uint32 `mapstructure:"embedded_port"`
+	EmbeddedUser     string `mapstructure:"embedded_user"`
+	EmbeddedPassword string `mapstructure:"embedded_password"`
+	EmbeddedDatabase string `mapstructure:"embedded_database"`
+	EmbeddedDataDir  string `mapstructure:"embedded_data_dir"`
+	EmbeddedCacheDir string `mapstructure:"embedded_cache_dir"`
+	MaxConns         int32  `mapstructure:"max_conns"`
 }
 
 // Pebble configures the embedded Pebble KV backend. Path is the data directory
@@ -195,6 +214,14 @@ func setDefaults() {
 	viper.SetDefault("store.pebble.memtable_size_mb", 64)
 	viper.SetDefault("store.pebble.l0_compaction_threshold", 4)
 	viper.SetDefault("store.pebble.sync_writes", false)
+	viper.SetDefault("store.postgres.embedded", false)
+	viper.SetDefault("store.postgres.embedded_port", 0)
+	viper.SetDefault("store.postgres.embedded_user", "arcade")
+	viper.SetDefault("store.postgres.embedded_password", "arcade")
+	viper.SetDefault("store.postgres.embedded_database", "arcade")
+	viper.SetDefault("store.postgres.embedded_data_dir", "~/.arcade/postgres")
+	viper.SetDefault("store.postgres.embedded_cache_dir", "~/.arcade/postgres-cache")
+	viper.SetDefault("store.postgres.max_conns", 16)
 	viper.SetDefault("health.port", 8081)
 	viper.SetDefault("propagation.merkle_concurrency", 10)
 	viper.SetDefault("propagation.retry_max_attempts", 5)
@@ -235,8 +262,12 @@ func validate(cfg *Config) error {
 		if cfg.Store.Pebble.Path == "" {
 			return fmt.Errorf("store.pebble.path is required when store.backend=pebble")
 		}
+	case "postgres":
+		if !cfg.Store.Postgres.Embedded && cfg.Store.Postgres.DSN == "" {
+			return fmt.Errorf("store.postgres.dsn is required when store.backend=postgres and postgres.embedded=false")
+		}
 	default:
-		return fmt.Errorf("unknown store.backend %q (expected aerospike or pebble)", cfg.Store.Backend)
+		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, or postgres)", cfg.Store.Backend)
 	}
 	validModes := map[string]bool{
 		"all": true, "api-server": true,

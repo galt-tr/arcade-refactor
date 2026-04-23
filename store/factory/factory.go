@@ -4,12 +4,15 @@
 package factory
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/store/aerospike"
 	"github.com/bsv-blockchain/arcade/store/pebble"
+	"github.com/bsv-blockchain/arcade/store/postgres"
 )
 
 // New constructs a Store and Leaser pair dispatching on cfg.Store.Backend.
@@ -26,6 +29,17 @@ func New(cfg *config.Config) (store.Store, store.Leaser, error) {
 		return s, s, nil
 	case "pebble":
 		s, err := pebble.New(cfg.Store.Pebble)
+		if err != nil {
+			return nil, nil, err
+		}
+		return s, s, nil
+	case "postgres":
+		// Embedded Postgres extraction on first run can take tens of seconds;
+		// give the connect phase a generous ceiling so the CLI fails fast on
+		// real misconfigs rather than hanging forever.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		s, err := postgres.New(ctx, cfg.Store.Postgres)
 		if err != nil {
 			return nil, nil, err
 		}
