@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -623,10 +625,10 @@ func scanStatus(row rowScanner) (*models.TransactionStatus, error) {
 	return &st, nil
 }
 
-// enrichMerklePath matches the behavior of the other backends: for mined /
-// immutable rows with a stored BUMP, extract the per-tx path so API
-// responses don't expose the compound. Extraction logic is duplicated across
-// backends to keep the per-backend package fully self-contained.
+// enrichMerklePath attaches the per-tx minimal merkle path for mined/immutable
+// rows, extracting it from the compound BUMP. Matches aerospike/pebble — the
+// extraction is duplicated across backends so each store package stays
+// self-contained.
 func (s *Store) enrichMerklePath(ctx context.Context, status *models.TransactionStatus) {
 	if status == nil || len(status.MerklePath) > 0 || status.BlockHash == "" {
 		return
@@ -638,10 +640,56 @@ func (s *Store) enrichMerklePath(ctx context.Context, status *models.Transaction
 	if err != nil || len(bumpData) == 0 {
 		return
 	}
-	// Keep the heavy chain-sdk import out of this file by leaving the
-	// full minimal-path extraction to a helper. The full extraction is
-	// identical to the aerospike/pebble implementations — for standalone
-	// Postgres use we just surface the compound so downstream clients can
-	// locally extract the tx-specific path.
-	status.MerklePath = bumpData
+	status.MerklePath = extractMinimalPathForTx(bumpData, status.TxID)
+}
+
+func extractMinimalPathForTx(bumpData []byte, txid string) []byte {
+	compound, err := transaction.NewMerklePathFromBinary(bumpData)
+	if err != nil {
+		return nil
+	}
+	txHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil
+	}
+
+	var txOffset uint64
+	found := false
+	if len(compound.Path) > 0 {
+		for _, leaf := range compound.Path[0] {
+			if leaf.Hash != nil && *leaf.Hash == *txHash {
+				txOffset = leaf.Offset
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		return nil
+	}
+
+	mp := &transaction.MerklePath{
+		BlockHeight: compound.BlockHeight,
+		Path:        make([][]*transaction.PathElement, len(compound.Path)),
+	}
+	offset := txOffset
+	for level := 0; level < len(compound.Path); level++ {
+		if level == 0 {
+			for _, leaf := range compound.Path[level] {
+				if leaf.Offset == offset {
+					mp.Path[level] = append(mp.Path[level], leaf)
+					break
+				}
+			}
+		}
+		sibOffset := offset ^ 1
+		for _, leaf := range compound.Path[level] {
+			if leaf.Offset == sibOffset {
+				mp.Path[level] = append(mp.Path[level], leaf)
+				break
+			}
+		}
+		offset = offset >> 1
+	}
+	return mp.Bytes()
 }
