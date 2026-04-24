@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -133,7 +134,8 @@ func NewClient(endpoints []string, authToken string, hc HealthConfig) *Client {
 		health:    make(map[string]*endpointHealth, len(endpoints)),
 		authToken: authToken,
 		httpClient: &http.Client{
-			Timeout: defaultTimeout,
+			Timeout:   defaultTimeout,
+			Transport: newBroadcastTransport(),
 		},
 		failureThreshold:    hc.FailureThreshold,
 		probeInterval:       hc.ProbeInterval,
@@ -474,6 +476,29 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 	}
 
 	return resp.StatusCode, nil
+}
+
+// newBroadcastTransport configures an http.Transport sized for fan-out
+// broadcasts to a handful of datahub endpoints at hundreds of TPS. The
+// DefaultTransport's per-host idle cap of 2 is far too tight for this workload
+// — under load Go would tear down and re-establish connections constantly.
+// Values here are sized for ~10 datahubs and several hundred concurrent
+// requests per endpoint; raise MaxConnsPerHost if the fleet grows.
+func newBroadcastTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		MaxConnsPerHost:       200,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
 
 // drainAndClose ensures the response body is fully consumed before close so
