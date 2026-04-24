@@ -402,7 +402,7 @@ func (c *Client) probeEndpoint(ctx context.Context, endpoint string) {
 		c.RecordFailure(endpoint)
 		return
 	}
-	_ = resp.Body.Close()
+	drainAndClose(resp.Body)
 	c.RecordSuccess(endpoint)
 }
 
@@ -425,9 +425,7 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 	if err != nil {
 		return 0, fmt.Errorf("failed to submit transaction: %w", err)
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(resp.Body)
@@ -468,9 +466,7 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 	if err != nil {
 		return 0, fmt.Errorf("failed to submit transactions: %w", err)
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -478,4 +474,14 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 	}
 
 	return resp.StatusCode, nil
+}
+
+// drainAndClose ensures the response body is fully consumed before close so
+// net/http can return the underlying TCP connection to the idle pool. Without
+// the drain Go silently skips connection reuse — at hundreds of TPS across
+// several datahubs that's thousands of extra handshakes and TIME_WAIT entries
+// per second.
+func drainAndClose(body io.ReadCloser) {
+	_, _ = io.Copy(io.Discard, body)
+	_ = body.Close()
 }
