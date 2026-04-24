@@ -128,7 +128,7 @@ func TestMemoryBroker_ConsumerGroupDrainThenFlush(t *testing.T) {
 			processed.Add(1)
 			return nil
 		},
-		FlushFunc: func() error {
+		FlushFunc: func(ctx context.Context) error {
 			flushes.Add(1)
 			return nil
 		},

@@ -84,7 +84,7 @@ func TestValidatorBatch_AccumulateAndFlush(t *testing.T) {
 	}
 
 	// Flush (as the consumer would after draining the channel)
-	if err := v.flushPropagation(); err != nil {
+	if err := v.flushPropagation(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -102,7 +102,7 @@ func TestValidatorBatch_FlushIsNoOpWhenEmpty(t *testing.T) {
 	v := newTestValidator(broker, ms)
 
 	// Flush with no pending messages should be a no-op
-	if err := v.flushPropagation(); err != nil {
+	if err := v.flushPropagation(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 	if broker.BatchCalls != 0 {
@@ -123,7 +123,7 @@ func TestValidatorBatch_SingleTxWorks(t *testing.T) {
 	}
 
 	// Flush single message
-	if err := v.flushPropagation(); err != nil {
+	if err := v.flushPropagation(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 

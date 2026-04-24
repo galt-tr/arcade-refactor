@@ -18,20 +18,26 @@ type ConsumerGroup struct {
 	sub        Subscription
 	topics     []string
 	handler    MessageHandler
-	flushFunc  func() error
+	flushFunc  FlushFunc
 	producer   *Producer
 	maxRetries int
 	logger     *zap.Logger
 	ready      chan struct{}
 }
 
+// FlushFunc is called after a drain of immediately-ready messages. The
+// context belongs to the current claim — when the claim ends (shutdown or
+// rebalance) the context is already cancelled, so downstream work (broadcasts,
+// store writes) can abort cleanly instead of running on Background.
+type FlushFunc func(ctx context.Context) error
+
 type ConsumerConfig struct {
 	Broker     Broker
 	GroupID    string
 	Topics     []string
 	Handler    MessageHandler
-	FlushFunc  func() error // called when claim channel drains or ends
-	Producer   *Producer    // used for DLQ routing
+	FlushFunc  FlushFunc // called when claim channel drains or ends
+	Producer   *Producer // used for DLQ routing
 	MaxRetries int
 	Logger     *zap.Logger
 }
@@ -83,9 +89,13 @@ func (c *ConsumerGroup) Close() error {
 
 // handleClaim processes messages from a single claim with the drain-then-flush
 // pattern. defer flush() runs when the claim ends (shutdown or rebalance), so
-// accumulated state never leaks across a rebalance boundary.
+// accumulated state never leaks across a rebalance boundary. The claim's
+// context is passed into the flush hook so downstream work (broadcasts, store
+// writes) unwinds when the claim is revoked instead of running on
+// context.Background.
 func (c *ConsumerGroup) handleClaim(claim Claim) error {
-	defer c.flush()
+	ctx := claim.Context()
+	defer c.flush(ctx)
 	for {
 		select {
 		case msg, ok := <-claim.Messages():
@@ -109,9 +119,9 @@ func (c *ConsumerGroup) handleClaim(claim Claim) error {
 				}
 			}
 		drainDone:
-			c.flush()
+			c.flush(ctx)
 
-		case <-claim.Context().Done():
+		case <-ctx.Done():
 			return nil
 		}
 	}
@@ -124,11 +134,11 @@ func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
 	claim.MarkMessage(msg)
 }
 
-func (c *ConsumerGroup) flush() {
+func (c *ConsumerGroup) flush(ctx context.Context) {
 	if c.flushFunc == nil {
 		return
 	}
-	if err := c.flushFunc(); err != nil {
+	if err := c.flushFunc(ctx); err != nil {
 		c.logger.Error("flush failed", zap.Error(err))
 	}
 }

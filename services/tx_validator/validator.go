@@ -163,7 +163,10 @@ func (v *Validator) handleNewTransaction(ctx context.Context, msg txMessage) err
 }
 
 // flushPropagation publishes all pending propagation messages in a single batch.
-func (v *Validator) flushPropagation() error {
+// The context comes from the current Kafka claim; a rebalance or shutdown
+// cancels it so the downstream publish can abort cleanly rather than finish on
+// behalf of a partition this consumer no longer owns.
+func (v *Validator) flushPropagation(_ context.Context) error {
 	v.mu.Lock()
 	pending := v.pendingProps
 	v.pendingProps = nil

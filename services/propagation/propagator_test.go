@@ -309,7 +309,7 @@ func handleAndFlush(t *testing.T, p *Propagator, payload []byte) error {
 	if err := p.handleMessage(context.Background(), consumerMsg(payload)); err != nil {
 		return err
 	}
-	return p.flushBatch()
+	return p.flushBatch(context.Background())
 }
 
 // Test 1: Registration happens before broadcast on success (single message)
@@ -438,7 +438,7 @@ func TestHandleMessage_BatchAllRegistered(t *testing.T) {
 	}
 
 	// Flush the batch
-	if err := p.flushBatch(); err != nil {
+	if err := p.flushBatch(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -548,7 +548,7 @@ func TestProcessBatch_100Transactions(t *testing.T) {
 	}
 
 	// Flush
-	if err := p.flushBatch(); err != nil {
+	if err := p.flushBatch(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -591,7 +591,7 @@ func TestProcessBatch_ChunksOversizedBatch(t *testing.T) {
 	for i := 0; i < 25; i++ {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%03d", i))))
 	}
-	if err := p.flushBatch(); err != nil {
+	if err := p.flushBatch(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -622,7 +622,7 @@ func TestProcessBatch_MerkleFailure_AbortsBatch(t *testing.T) {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
 	}
 
-	err := p.flushBatch()
+	err := p.flushBatch(context.Background())
 	if err == nil {
 		t.Fatal("expected error from merkle failure")
 	}
@@ -653,7 +653,7 @@ func TestProcessBatch_NilMerkleClient_SkipsRegistration(t *testing.T) {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
 	}
 
-	if err := p.flushBatch(); err != nil {
+	if err := p.flushBatch(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -702,7 +702,7 @@ func TestBatchTransactions_UsesTxsEndpoint(t *testing.T) {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
 	}
 
-	if err := p.flushBatch(); err != nil {
+	if err := p.flushBatch(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -789,7 +789,7 @@ func TestBatchTransactions_AnySuccess_AcceptedByNetwork(t *testing.T) {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
 	}
 
-	if err := p.flushBatch(); err != nil {
+	if err := p.flushBatch(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 
@@ -820,7 +820,7 @@ func TestBatchTransactions_AllFail_Rejected(t *testing.T) {
 		_ = p.handleMessage(context.Background(), consumerMsg(makePropMsg(fmt.Sprintf("tx%d", i))))
 	}
 
-	if err := p.flushBatch(); err != nil {
+	if err := p.flushBatch(context.Background()); err != nil {
 		t.Fatalf("flush error: %v", err)
 	}
 

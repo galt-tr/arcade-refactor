@@ -189,7 +189,12 @@ func (p *Propagator) handleMessage(ctx context.Context, msg *kafka.Message) erro
 // flushBatch processes all accumulated messages as a batch. Retry work
 // belongs to the reaper goroutine — it is no longer coupled to the consumer's
 // drain-flush cycle, so live ingest doesn't have to wait on rebroadcasts.
-func (p *Propagator) flushBatch() error {
+//
+// The context comes from the current Kafka claim — it is cancelled when the
+// claim ends (shutdown or rebalance). Downstream HTTP broadcasts and store
+// writes observe that cancellation and unwind cleanly, so a revoked partition
+// doesn't keep doing work on behalf of a partition it no longer owns.
+func (p *Propagator) flushBatch(ctx context.Context) error {
 	p.mu.Lock()
 	batch := p.pendingMsgs
 	p.pendingMsgs = nil
@@ -198,7 +203,7 @@ func (p *Propagator) flushBatch() error {
 	if len(batch) == 0 {
 		return nil
 	}
-	return p.processBatch(context.Background(), batch)
+	return p.processBatch(ctx, batch)
 }
 
 // txResult carries per-tx outcome of a broadcast, used by both the initial
