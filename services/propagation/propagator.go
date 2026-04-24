@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -201,11 +202,14 @@ func (p *Propagator) flushBatch() error {
 }
 
 // txResult carries per-tx outcome of a broadcast, used by both the initial
-// processBatch path and the reaper.
+// processBatch path and the reaper. successEndpoint is the URL of the peer
+// whose response drove the accepted status (empty when no peer accepted or
+// the broadcast produced no verdict), useful for operator-visible logs.
 type txResult struct {
-	status   *models.TransactionStatus
-	errMsg   string
-	rawTxHex string
+	status          *models.TransactionStatus
+	errMsg          string
+	rawTxHex        string
+	successEndpoint string
 }
 
 // processBatch handles a batch of propagation messages:
@@ -251,7 +255,15 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 	results := p.broadcastInChunks(ctx, batch, rawTxs)
 
 	// Step 3: Update status for each transaction, with retry classification
+	seenEndpoints := make(map[string]struct{})
+	var successEndpoints []string
 	for i, res := range results {
+		if res.successEndpoint != "" {
+			if _, ok := seenEndpoints[res.successEndpoint]; !ok {
+				seenEndpoints[res.successEndpoint] = struct{}{}
+				successEndpoints = append(successEndpoints, res.successEndpoint)
+			}
+		}
 		if res.status == nil {
 			continue
 		}
@@ -267,7 +279,10 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 		}
 	}
 
-	p.logger.Info("batch propagated", zap.Int("count", len(batch)))
+	p.logger.Info("batch propagated",
+		zap.Int("count", len(batch)),
+		zap.Strings("success_endpoints", successEndpoints),
+	)
 	return nil
 }
 
@@ -298,11 +313,11 @@ func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationM
 func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg, rawTxs [][]byte, out []txResult) {
 	if len(chunk) == 1 {
 		br := p.broadcastSingleToEndpoints(ctx, rawTxs[0], chunk[0].TXID)
-		out[0] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: chunk[0].RawTx}
+		out[0] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: chunk[0].RawTx, successEndpoint: br.SuccessEndpoint}
 		return
 	}
 
-	batchStatuses := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk)
+	batchStatuses, batchSuccessEndpoint := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk)
 	allRejected := len(batchStatuses) > 0
 	for _, s := range batchStatuses {
 		if s != nil && s.Status != models.StatusRejected {
@@ -312,7 +327,7 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 	}
 	if !allRejected {
 		for i, s := range batchStatuses {
-			out[i] = txResult{status: s, rawTxHex: chunk[i].RawTx}
+			out[i] = txResult{status: s, rawTxHex: chunk[i].RawTx, successEndpoint: batchSuccessEndpoint}
 		}
 		return
 	}
@@ -322,7 +337,7 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 	var accepted, rejected, retryable int
 	for i, msg := range chunk {
 		br := p.broadcastSingleToEndpoints(ctx, rawTxs[i], msg.TXID)
-		out[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: msg.RawTx}
+		out[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: msg.RawTx, successEndpoint: br.SuccessEndpoint}
 		switch {
 		case br.Status == nil:
 			// no verdict (202 or all timed out)
@@ -346,17 +361,21 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 
 // broadcastResult holds the outcome of a single-tx broadcast across all endpoints.
 type broadcastResult struct {
-	Status   *models.TransactionStatus
-	ErrorMsg string // best error message from endpoints (for retryable classification)
+	Status          *models.TransactionStatus
+	ErrorMsg        string // best error message from endpoints (for retryable classification)
+	SuccessEndpoint string // URL of the peer that accepted the tx (empty if none did)
 }
 
-// broadcastSingleToEndpoints submits a single transaction to each teranode endpoint
-// using POST /tx, matching the original ARC single-tx broadcast behavior.
-// Returns the best status and the error message from the best-matching endpoint failure.
+// broadcastSingleToEndpoints submits a single transaction to each healthy
+// teranode endpoint using POST /tx. On the first accepting endpoint (200 OK)
+// the shared broadcast context is cancelled so slower sibling requests don't
+// gate wall-time on the slowest peer. Per-endpoint outcomes are recorded into
+// the teranode client's circuit-breaker so repeatedly failing peers are
+// sidelined from future broadcasts.
 func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byte, txid string) broadcastResult {
-	endpoints := p.teranodeClient.GetEndpoints()
+	endpoints := p.teranodeClient.GetHealthyEndpoints()
 	if len(endpoints) == 0 {
-		p.logger.Error("no teranode endpoints configured")
+		p.logger.Error("no healthy teranode endpoints")
 		return broadcastResult{}
 	}
 
@@ -366,16 +385,18 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 		err        error
 	}
 
-	resultCh := make(chan endpointResult, len(endpoints))
-	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
+	submitCtx, cancelSubmit := context.WithTimeout(ctx, 15*time.Second)
+	defer cancelSubmit()
+	broadcastCtx, cancelBroadcast := context.WithCancel(submitCtx)
+	defer cancelBroadcast()
 
+	resultCh := make(chan endpointResult, len(endpoints))
 	var wg sync.WaitGroup
 	for _, endpoint := range endpoints {
 		wg.Add(1)
 		go func(ep string) {
 			defer wg.Done()
-			statusCode, err := p.teranodeClient.SubmitTransaction(submitCtx, ep, rawTx)
+			statusCode, err := p.teranodeClient.SubmitTransaction(broadcastCtx, ep, rawTx)
 			resultCh <- endpointResult{endpoint: ep, statusCode: statusCode, err: err}
 		}(endpoint)
 	}
@@ -385,13 +406,24 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 		close(resultCh)
 	}()
 
-	// Find best status: 200→AcceptedByNetwork, 202→nil (no update), error→Rejected.
-	// Per-endpoint outcomes are not logged — in a per-tx fallback path that
-	// produces one DEBUG line per tx (N per chunk), drowning out useful signal.
-	// Aggregate summaries are emitted by the caller (broadcastChunk).
 	var bestStatus models.Status
 	var lastErrMsg string
+	var successEndpoint string
 	for result := range resultCh {
+		// A sibling request cancelled by a winning race is not a real failure —
+		// the peer didn't misbehave, we called off the race. Skip health
+		// recording and status aggregation for that case.
+		if isCancelledByBroadcast(result.err, broadcastCtx) {
+			continue
+		}
+		// Health recording is about *reachability*, not about whether the peer
+		// accepted this specific tx. statusCode == 0 means the HTTP client never
+		// received a response (transport error / timeout / DNS failure) — the
+		// peer is unreachable and that counts against the circuit-breaker. Any
+		// non-zero status code means the peer responded, so it is alive; a
+		// 4xx/5xx body is a legitimate "your tx was rejected" answer, not a
+		// reason to sideline the peer.
+		recordEndpointOutcome(p.teranodeClient, result.endpoint, result.statusCode)
 		if result.err != nil {
 			lastErrMsg = result.err.Error()
 			if statusPriority(models.StatusRejected) > statusPriority(bestStatus) {
@@ -403,9 +435,15 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 		case http.StatusOK:
 			if statusPriority(models.StatusAcceptedByNetwork) > statusPriority(bestStatus) {
 				bestStatus = models.StatusAcceptedByNetwork
+				successEndpoint = result.endpoint
 			}
+			// Early-cancel: the first 200 is the verdict. Sibling requests
+			// observe broadcastCtx.Err() and return quickly.
+			cancelBroadcast()
 		case http.StatusAccepted:
-			// 202 means no status update — matching original behavior
+			// 202 means the peer accepted the tx but won't tell us yet —
+			// matching original behavior, no tx-level status update.
+			cancelBroadcast()
 		}
 	}
 
@@ -419,36 +457,72 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 			Status:    bestStatus,
 			Timestamp: time.Now(),
 		},
-		ErrorMsg: lastErrMsg,
+		ErrorMsg:        lastErrMsg,
+		SuccessEndpoint: successEndpoint,
 	}
 }
 
-// broadcastBatchToEndpoints submits all transactions to each teranode endpoint
-// using the batch POST /txs endpoint. Uses binary success/failure logic matching
-// the original: any endpoint success → AcceptedByNetwork for all, all fail → Rejected for all.
-func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) []*models.TransactionStatus {
-	endpoints := p.teranodeClient.GetEndpoints()
+// isCancelledByBroadcast reports whether err is a context.Canceled directly
+// caused by the broadcast's own cancel signal (i.e. the winning race). A
+// context.Canceled that wasn't triggered by the broadcast cancel still counts
+// as a real failure — e.g. the outer submitCtx timing out.
+func isCancelledByBroadcast(err error, broadcastCtx context.Context) bool {
+	if err == nil {
+		return false
+	}
+	if broadcastCtx.Err() == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled)
+}
+
+// recordEndpointOutcome routes a broadcast result into the teranode client's
+// circuit-breaker based on whether the peer responded at all. statusCode == 0
+// is the int zero value returned by Submit{Transaction,Transactions} when no
+// HTTP response was received; any non-zero status means the peer is alive,
+// regardless of whether it accepted this particular payload.
+func recordEndpointOutcome(tc *teranode.Client, endpoint string, statusCode int) {
+	if statusCode == 0 {
+		tc.RecordFailure(endpoint)
+		return
+	}
+	tc.RecordSuccess(endpoint)
+}
+
+// broadcastBatchToEndpoints submits all transactions to each healthy teranode
+// endpoint using the batch POST /txs endpoint. Binary outcome matches the
+// original: any endpoint success → AcceptedByNetwork for all, all fail →
+// Rejected for all. The first accepting endpoint cancels sibling requests so
+// a slow peer doesn't gate wall-time. Per-endpoint outcomes are recorded into
+// the circuit-breaker regardless of the batch verdict. The returned
+// successEndpoint is the URL of the first peer that accepted the batch (empty
+// if none did) — surfaced so operator logs can show which peer served a batch.
+func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) (statuses []*models.TransactionStatus, successEndpoint string) {
+	endpoints := p.teranodeClient.GetHealthyEndpoints()
 	if len(endpoints) == 0 {
-		p.logger.Error("no teranode endpoints configured")
-		return make([]*models.TransactionStatus, len(batch))
+		p.logger.Error("no healthy teranode endpoints")
+		return make([]*models.TransactionStatus, len(batch)), ""
 	}
 
 	type endpointResult struct {
-		endpoint string
-		err      error
+		endpoint   string
+		statusCode int
+		err        error
 	}
 
-	resultCh := make(chan endpointResult, len(endpoints))
-	submitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
+	submitCtx, cancelSubmit := context.WithTimeout(ctx, 15*time.Second)
+	defer cancelSubmit()
+	broadcastCtx, cancelBroadcast := context.WithCancel(submitCtx)
+	defer cancelBroadcast()
 
+	resultCh := make(chan endpointResult, len(endpoints))
 	var wg sync.WaitGroup
 	for _, endpoint := range endpoints {
 		wg.Add(1)
 		go func(ep string) {
 			defer wg.Done()
-			_, err := p.teranodeClient.SubmitTransactions(submitCtx, ep, rawTxs)
-			resultCh <- endpointResult{endpoint: ep, err: err}
+			statusCode, err := p.teranodeClient.SubmitTransactions(broadcastCtx, ep, rawTxs)
+			resultCh <- endpointResult{endpoint: ep, statusCode: statusCode, err: err}
 		}(endpoint)
 	}
 
@@ -457,22 +531,35 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		close(resultCh)
 	}()
 
-	// Binary outcome: any success → AcceptedByNetwork, all fail → Rejected
 	anySuccess := false
 	for result := range resultCh {
+		if isCancelledByBroadcast(result.err, broadcastCtx) {
+			continue
+		}
+		// Reachability-based health: any HTTP response (even 5xx) means the
+		// peer is alive. Only a missing response (statusCode == 0) counts
+		// against the circuit-breaker.
+		recordEndpointOutcome(p.teranodeClient, result.endpoint, result.statusCode)
 		if result.err != nil {
 			p.logger.Warn("batch broadcast endpoint failed",
 				zap.String("endpoint", result.endpoint),
 				zap.Int("batch_size", len(batch)),
+				zap.Int("status_code", result.statusCode),
 				zap.Error(result.err),
 			)
-		} else {
-			p.logger.Debug("batch broadcast endpoint succeeded",
-				zap.String("endpoint", result.endpoint),
-				zap.Int("batch_size", len(batch)),
-			)
-			anySuccess = true
+			continue
 		}
+		p.logger.Debug("batch broadcast endpoint succeeded",
+			zap.String("endpoint", result.endpoint),
+			zap.Int("batch_size", len(batch)),
+		)
+		if !anySuccess {
+			successEndpoint = result.endpoint
+		}
+		anySuccess = true
+		// Early-cancel: binary verdict is already known once any endpoint
+		// accepts; siblings running against slow peers stop wasting time.
+		cancelBroadcast()
 	}
 
 	p.logger.Debug("batch broadcast complete",
@@ -482,7 +569,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	)
 
 	now := time.Now()
-	statuses := make([]*models.TransactionStatus, len(batch))
+	statuses = make([]*models.TransactionStatus, len(batch))
 	status := models.StatusRejected
 	if anySuccess {
 		status = models.StatusAcceptedByNetwork
@@ -495,7 +582,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		}
 	}
 
-	return statuses
+	return statuses, successEndpoint
 }
 
 // handleRetryableFailure marks a tx for durable retry. The two-call pattern
