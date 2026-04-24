@@ -29,10 +29,24 @@ type Broker interface {
 	// its Consume method.
 	Subscribe(groupID string, topics []string) (Subscription, error)
 
+	// PartitionCount reports how many partitions the given topic has. Returns
+	// ErrTopicNotFound if the topic does not exist on the broker. Memory-backed
+	// implementations always return 1 since standalone mode has no concept of
+	// partitions. Used at startup to validate that a horizontally scaled
+	// deployment actually has enough partitions for the pod count.
+	PartitionCount(topic string) (int, error)
+
 	// Close tears down broker-level resources. After Close, further Send/Subscribe
 	// calls return an error.
 	Close() error
 }
+
+// ErrTopicNotFound is returned by PartitionCount when the topic does not exist.
+var ErrTopicNotFound = errBrokerSentinel("topic not found")
+
+type errBrokerSentinel string
+
+func (e errBrokerSentinel) Error() string { return string(e) }
 
 // Subscription is a handle on an active consumer-group membership. The Consume
 // method is claim-oriented to preserve the drain-then-flush correctness

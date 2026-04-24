@@ -65,6 +65,17 @@ func run(cmd *cobra.Command, _ []string) error {
 	producer := kafka.NewProducer(broker)
 	defer producer.Close()
 
+	// Validate that the hot-path topics have enough partitions for the
+	// deployment. min_partitions is operator-supplied — leave unset (0/1) in
+	// standalone or single-replica deployments; set to the expected replica
+	// count in K8s. Fails fast on misconfigured horizontally-scaled topics so
+	// the error surfaces before live traffic arrives.
+	if cfg.Kafka.MinPartitions > 1 {
+		if err := kafka.CheckPartitions(broker, []string{kafka.TopicTransaction, kafka.TopicPropagation}, cfg.Kafka.MinPartitions, logger); err != nil {
+			return fmt.Errorf("kafka partition check: %w", err)
+		}
+	}
+
 	st, leaser, err := storefactory.New(cfg)
 	if err != nil {
 		return fmt.Errorf("creating store: %w", err)

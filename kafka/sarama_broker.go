@@ -115,6 +115,23 @@ func (b *saramaBroker) Subscribe(groupID string, topics []string) (Subscription,
 	return &saramaSubscription{group: group, topics: topics}, nil
 }
 
+func (b *saramaBroker) PartitionCount(topic string) (int, error) {
+	client, err := sarama.NewClient(b.brokers, sarama.NewConfig())
+	if err != nil {
+		return 0, fmt.Errorf("creating metadata client: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	partitions, err := client.Partitions(topic)
+	if err != nil {
+		if errors.Is(err, sarama.ErrUnknownTopicOrPartition) {
+			return 0, ErrTopicNotFound
+		}
+		return 0, fmt.Errorf("listing partitions for %s: %w", topic, err)
+	}
+	return len(partitions), nil
+}
+
 func (b *saramaBroker) Close() error {
 	var errs []error
 	if err := b.syncProducer.Close(); err != nil {

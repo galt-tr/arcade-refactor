@@ -81,6 +81,9 @@ func (b *RecordingBroker) Subscribe(string, []string) (Subscription, error) {
 	panic("RecordingBroker: Subscribe not supported — use NewMemoryBroker for consume tests")
 }
 
+// PartitionCount returns 1 since tests don't exercise multi-partition topics.
+func (b *RecordingBroker) PartitionCount(_ string) (int, error) { return 1, nil }
+
 // Close is a no-op.
 func (b *RecordingBroker) Close() error { return nil }
 

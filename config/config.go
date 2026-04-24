@@ -101,6 +101,12 @@ type Kafka struct {
 	ConsumerGroup string   `mapstructure:"consumer_group"`
 	MaxRetries    int      `mapstructure:"max_retries"`
 	BufferSize    int      `mapstructure:"buffer_size"`
+	// MinPartitions is the minimum number of partitions every hot-path topic
+	// must have at startup. Set to the expected replica count of the largest
+	// horizontally-scaled consumer (tx-validator or propagation) so arcade
+	// fails fast when the cluster can't actually fan out across pods. Leave
+	// at 0 or 1 in standalone/single-replica deployments.
+	MinPartitions int `mapstructure:"min_partitions"`
 }
 
 // Store picks the persistence backend. Backend dispatches construction in

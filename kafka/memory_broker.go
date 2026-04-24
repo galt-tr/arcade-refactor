@@ -168,6 +168,12 @@ func forward(in <-chan *Message, out chan<- *Message) {
 	}
 }
 
+func (b *memoryBroker) PartitionCount(_ string) (int, error) {
+	// Memory broker has no concept of partitions — treat every topic as a
+	// single-partition topic so callers can compute concurrency uniformly.
+	return 1, nil
+}
+
 func (b *memoryBroker) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
