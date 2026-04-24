@@ -1,6 +1,7 @@
 package api_server
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"html/template"
 	"io"
@@ -16,6 +17,21 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 	sdkTx "github.com/bsv-blockchain/go-sdk/transaction"
 )
+
+// computeTxID returns the canonical Bitcoin transaction ID — little-endian
+// reversed double-SHA256 of the raw serialized transaction — as lowercase hex.
+// Used only for Kafka partition keying at ingress, so a malformed body just
+// hashes to whatever its bytes spell; the downstream validator still parses
+// and can reject.
+func computeTxID(rawTx []byte) string {
+	first := sha256.Sum256(rawTx)
+	second := sha256.Sum256(first[:])
+	// Reverse so the string matches the canonical big-endian txid display.
+	for i, j := 0, len(second)-1; i < j; i, j = i+1, j-1 {
+		second[i], second[j] = second[j], second[i]
+	}
+	return hex.EncodeToString(second[:])
+}
 
 const docsTemplate = `<!DOCTYPE html>
 <html>
@@ -320,12 +336,16 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 		return
 	}
 
-	// Publish to transaction topic for validation
+	// Publish to transaction topic for validation. Keying by txid pins the tx
+	// to one Kafka partition, so any re-submission (retry, user double-post)
+	// lands on the same consumer — a future idempotency check can then see the
+	// duplicate instead of having it fan out across replicas.
+	txid := computeTxID(rawTx)
 	msg := map[string]interface{}{
 		"action": "submit",
 		"raw_tx": hex.EncodeToString(rawTx),
 	}
-	if err := s.producer.Send(kafka.TopicTransaction, "", msg); err != nil {
+	if err := s.producer.Send(kafka.TopicTransaction, txid, msg); err != nil {
 		s.logger.Error("failed to publish transaction", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to submit"})
 		return
@@ -373,7 +393,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 
 		rawTxBytes := body[offset : offset+bytesUsed]
 		msgs = append(msgs, kafka.KeyValue{
-			Key: "",
+			Key: computeTxID(rawTxBytes),
 			Value: map[string]interface{}{
 				"action": "submit",
 				"raw_tx": hex.EncodeToString(rawTxBytes),
