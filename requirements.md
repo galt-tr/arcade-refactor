@@ -54,7 +54,7 @@ See [swimlane diagram](./diagram.png) for more details on how the integration wi
 - bump_builder
   - when a BLOCK_PROCESSED callback is issued, find all STUMPs received for that block and build a full BUMP using the coinbase merkle path. Store merkle paths for each transaction. Waits a configurable grace window before reading STUMPs so late-retry deliveries from merkle-service can land before BUMP construction.
 - propagation
-  - broadcasts transactions to all configured datahub URLs
+  - broadcasts transactions to all configured datahub URLs in parallel, using a per-endpoint circuit-breaker: endpoints that accumulate `propagation.endpoint_health.failure_threshold` consecutive *transport* failures (default 3) — connection refused, DNS failure, timeout with no bytes received — are marked unhealthy and skipped on subsequent broadcasts. Application-level rejections (4xx/5xx HTTP responses, e.g. Teranode's "missing inputs for tx") are NOT counted against a peer's health: the peer responded, so it is reachable. A background probe re-checks unhealthy endpoints via `GET /health` every `propagation.endpoint_health.probe_interval_ms` (default 30 s); any HTTP response — including 4xx/5xx — counts as "peer reachable" and restores the endpoint to the healthy set. First-success early-cancel ensures broadcast wall-time tracks the fastest healthy peer, not the slowest.
 - tx_validator
   - validate transaction or set of transactions
   - if valid, send for propagation
