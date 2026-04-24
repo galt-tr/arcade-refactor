@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -18,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/arcade/services"
 	"github.com/bsv-blockchain/arcade/services/api_server"
 	"github.com/bsv-blockchain/arcade/services/bump_builder"
+	"github.com/bsv-blockchain/arcade/services/p2p_client"
 	"github.com/bsv-blockchain/arcade/services/propagation"
 	"github.com/bsv-blockchain/arcade/services/tx_validator"
 	"github.com/bsv-blockchain/arcade/store"
@@ -75,7 +77,14 @@ func run(cmd *cobra.Command, _ []string) error {
 	// Create shared components
 	txTracker := store.NewTxTracker()
 
-	teranodeClient := teranode.NewClient(cfg.DatahubURLs, cfg.Teranode.AuthToken)
+	teranodeClient := teranode.NewClient(cfg.DatahubURLs, cfg.Teranode.AuthToken, teranode.HealthConfig{
+		FailureThreshold:    cfg.Propagation.EndpointHealth.FailureThreshold,
+		ProbeInterval:       time.Duration(cfg.Propagation.EndpointHealth.ProbeIntervalMs) * time.Millisecond,
+		ProbeTimeout:        time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
+		MinHealthyEndpoints: cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
+		Logger:              logger,
+	})
+	defer teranodeClient.Close()
 
 	var merkleClient *merkleservice.Client
 	if cfg.MerkleService.URL != "" {
@@ -89,6 +98,11 @@ func run(cmd *cobra.Command, _ []string) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Tie the teranode client's background probe to the service lifecycle so
+	// unhealthy endpoints are re-probed for recovery and the goroutine exits
+	// cleanly on shutdown.
+	teranodeClient.Start(ctx)
 
 	// Start health server for non-API modes (api-server serves /health on its own port)
 	if cfg.Mode != "api-server" {
@@ -153,7 +167,7 @@ func buildServices(
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, logger, producer, st, txTracker))
+		svcs = append(svcs, api_server.New(cfg, logger, producer, st, txTracker, teranodeClient))
 	}
 	if shouldRun("bump-builder") {
 		svcs = append(svcs, bump_builder.New(cfg, logger, producer, st))
@@ -163,6 +177,7 @@ func buildServices(
 	}
 	if shouldRun("propagation") {
 		svcs = append(svcs, propagation.New(cfg, logger, producer, st, leaser, teranodeClient, merkleClient))
+		svcs = append(svcs, p2p_client.New(cfg, logger, producer, teranodeClient))
 	}
 
 	return svcs
