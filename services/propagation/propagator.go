@@ -291,23 +291,57 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 	return nil
 }
 
+// maxParallelChunks caps how many chunk broadcasts run concurrently. Each
+// chunk already fans out to every healthy endpoint, so the real concurrency is
+// maxParallelChunks × len(endpoints). Keep this modest so a huge flush doesn't
+// open thousands of sockets at once.
+const maxParallelChunks = 4
+
 // broadcastInChunks splits a batch into teranodeBatchCap-sized chunks and
 // broadcasts each via /txs, falling back to per-tx /tx within a chunk only
-// when that chunk's batch broadcast is all-rejected. Returns per-tx results
-// in the same order as the input.
+// when that chunk's batch broadcast is all-rejected. Chunks run in parallel
+// bounded by maxParallelChunks so a large flush doesn't serialise behind one
+// slow endpoint. Returns per-tx results in the same order as the input.
 func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationMsg, rawTxs [][]byte) []txResult {
 	results := make([]txResult, len(batch))
 	chunkSize := p.teranodeBatchCap
 	if chunkSize <= 0 {
 		chunkSize = len(batch)
 	}
+
+	type chunk struct {
+		start, end int
+	}
+	var chunks []chunk
 	for start := 0; start < len(batch); start += chunkSize {
 		end := start + chunkSize
 		if end > len(batch) {
 			end = len(batch)
 		}
-		p.broadcastChunk(ctx, batch[start:end], rawTxs[start:end], results[start:end])
+		chunks = append(chunks, chunk{start: start, end: end})
 	}
+
+	if len(chunks) <= 1 {
+		if len(chunks) == 1 {
+			c := chunks[0]
+			p.broadcastChunk(ctx, batch[c.start:c.end], rawTxs[c.start:c.end], results[c.start:c.end])
+		}
+		return results
+	}
+
+	sem := make(chan struct{}, maxParallelChunks)
+	var wg sync.WaitGroup
+	for _, c := range chunks {
+		c := c
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			p.broadcastChunk(ctx, batch[c.start:c.end], rawTxs[c.start:c.end], results[c.start:c.end])
+		}()
+	}
+	wg.Wait()
 	return results
 }
 
