@@ -8,6 +8,14 @@ mode: all
 
 log_level: info
 
+# Bitcoin network everything in arcade attaches to. One of:
+#   mainnet      — production Bitcoin SV
+#   testnet      — public testnet
+#   teratestnet  — teranode scaling testnet
+# Both the libp2p datahub discovery client and the embedded chaintracks
+# instance derive their pubsub topic and bootstrap peers from this value.
+network: mainnet
+
 # callback_url: "https://example.com/callback"
 # callback_token: "your-callback-token"
 
@@ -42,9 +50,37 @@ merkle_service:
 
 p2p:
   seeds: []
+  # Peer discovery via go-teranode-p2p-client. When enabled, arcade subscribes
+  # to the canonical node_status topic (e.g. teranode/bitcoin/1.0.0/mainnet-node_status)
+  # and appends each peer's advertised datahub URL to the propagation endpoint
+  # list. Statically configured `datahub_urls` remain first in the list;
+  # discovered URLs are additive and deduplicated (including trailing-slash
+  # variants). Network and its bootstrap peers are derived from the top-level
+  # `network` value above; bootstrap_peers below only needs to be set to
+  # override or extend the built-in defaults (e.g. a private network).
+  # datahub_discovery: false
+  # listen_port: 9905
+  # dht_mode: off              # "server", "client", or "off" (library default is "off")
+  # storage_path: ""           # defaults to <top-level storage_path>/p2p; stores p2p_key.hex for stable peer ID
+  # bootstrap_peers: []        # override or extend the built-in defaults
+  # enable_mdns: false
+  # allow_private_urls: false  # accept loopback/RFC1918/link-local URLs from peers
 
 health:
   port: 8081
+
+# propagation:
+#   # Per-endpoint circuit-breaker for the datahub URL list. Endpoints that
+#   # accumulate `failure_threshold` consecutive failures are marked unhealthy
+#   # and excluded from broadcasts; a background probe hits GET /health on
+#   # unhealthy endpoints every `probe_interval_ms` to detect recovery. The
+#   # `min_healthy_endpoints` value is advisory — a WARN is logged when the
+#   # healthy count drops below it, but broadcasts are never blocked by it.
+#   endpoint_health:
+#     failure_threshold: 3
+#     probe_interval_ms: 30000
+#     probe_timeout_ms: 2000
+#     min_healthy_endpoints: 0
 
 bump_builder:
   # Grace window after BLOCK_PROCESSED before reading STUMPs, to allow for

@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/teranode"
 )
 
 type Server struct {
@@ -23,18 +24,20 @@ type Server struct {
 	producer    *kafka.Producer
 	store       store.Store
 	txTracker   *store.TxTracker
+	teranode    *teranode.Client        // used by /health for datahub URL inventory; nil in tests
 	server      *http.Server
 	chaintracks chaintracks.Chaintracks // nil when disabled
 	ctRoutes    *chaintracksRoutes      // nil when disabled
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, tracker *store.TxTracker) *Server {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, tracker *store.TxTracker, tc *teranode.Client) *Server {
 	return &Server{
 		cfg:       cfg,
 		logger:    logger.Named("api-server"),
 		producer:  producer,
 		store:     st,
 		txTracker: tracker,
+		teranode:  tc,
 	}
 }
 
@@ -104,6 +107,18 @@ func (s *Server) initChaintracks(ctx context.Context) error {
 			return fmt.Errorf("creating storage directory %s: %w", root, err)
 		}
 		s.cfg.Chaintracks.StoragePath = path.Join(root, "chaintracks")
+	}
+
+	// Thread the top-level network into chaintracks' embedded p2p config.
+	// Without this, go-chaintracks.Config.Initialize sees an empty Network and
+	// silently falls back to "main" — so a testnet/teratestnet arcade would
+	// still bootstrap its block headers from mainnet. Bootstrap peers are
+	// injected from the same resolver the discovery service uses, so chaintracks
+	// and the datahub client always agree on which network they joined.
+	topicNetwork, defaultBootstrap := config.ResolveP2PNetwork(s.cfg.Network)
+	s.cfg.Chaintracks.P2P.Network = topicNetwork
+	if len(s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers) == 0 {
+		s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers = defaultBootstrap
 	}
 
 	ct, err := s.cfg.Chaintracks.Initialize(ctx, "arcade", nil)

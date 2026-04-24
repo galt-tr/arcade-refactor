@@ -9,12 +9,58 @@ import (
 	"github.com/spf13/viper"
 )
 
+// Canonical network names accepted at the top-level `network` config key.
+// These are the only values operators ever type; internal mapping to the
+// go-teranode-p2p-client network identifiers lives in ResolveP2PNetwork.
+const (
+	NetworkMainnet     = "mainnet"
+	NetworkTestnet     = "testnet"
+	NetworkTeratestnet = "teratestnet"
+)
+
+// knownNetworks gates validate() and ResolveP2PNetwork.
+var knownNetworks = map[string]struct{}{
+	NetworkMainnet:     {},
+	NetworkTestnet:     {},
+	NetworkTeratestnet: {},
+}
+
+// ResolveP2PNetwork maps a canonical arcade network name to the values that
+// go-teranode-p2p-client expects: the network identifier used to build pubsub
+// topic names, and the bootstrap peer list to hand to libp2p.
+//
+// The upstream library's getDefaultBootstrapPeers returns bootstraps for the
+// keys "main"/"test"/"stn" — its "stn" entry points at
+// teratestnet.bootstrap.teranode.bsvb.tech while TopicName("stn", …) builds
+// ".../stn-node_status". That mismatch is why configuring network=stn fails to
+// see any teratestnet data hub URLs: the bootstrap DNS is right but the topic
+// name is wrong. We sidestep it by handing the library the canonical topic
+// network ("mainnet"/"testnet"/"teratestnet") and injecting the bootstrap peer
+// list ourselves — so topic and peers always agree.
+func ResolveP2PNetwork(network string) (topicNetwork string, bootstrapPeers []string) {
+	switch network {
+	case NetworkTestnet:
+		return NetworkTestnet, []string{"/dnsaddr/testnet.bootstrap.teranode.bsvb.tech"}
+	case NetworkTeratestnet:
+		return NetworkTeratestnet, []string{"/dnsaddr/teratestnet.bootstrap.teranode.bsvb.tech"}
+	case NetworkMainnet, "":
+		fallthrough
+	default:
+		return NetworkMainnet, []string{"/dnsaddr/mainnet.bootstrap.teranode.bsvb.tech"}
+	}
+}
+
 type Config struct {
 	Mode          string              `mapstructure:"mode"`
 	LogLevel      string              `mapstructure:"log_level"`
 	CallbackURL   string              `mapstructure:"callback_url"`
 	CallbackToken string              `mapstructure:"callback_token"`
 	StoragePath   string              `mapstructure:"storage_path"`
+	// Network selects the Bitcoin network everything downstream participates in.
+	// Canonical values: "mainnet", "testnet", "teratestnet". Propagated to the
+	// libp2p peer-discovery client and to the embedded chaintracks instance so
+	// they agree on pubsub topic and bootstrap peers.
+	Network       string              `mapstructure:"network"`
 	APIServer     API                 `mapstructure:"api"`
 	Kafka         Kafka               `mapstructure:"kafka"`
 	Store         Store               `mapstructure:"store"`
@@ -117,8 +163,25 @@ type MerkleServiceConfig struct {
 	AuthToken string `mapstructure:"auth_token"`
 }
 
+// P2PConfig controls the libp2p-based peer discovery service. Seeds is the
+// legacy block-announcement seed list; DatahubDiscovery and its siblings gate
+// the node_status subscription that auto-populates the propagation endpoint
+// list. When DatahubDiscovery is false, no libp2p client is started and the
+// rest of the P2P fields are ignored.
+//
+// The network is not set here — it comes from the top-level `network` config
+// value so the p2p client and embedded chaintracks stay in sync. Operators only
+// need BootstrapPeers here to override the canonical defaults resolved from
+// ResolveP2PNetwork (useful for private networks or bootstrap migrations).
 type P2PConfig struct {
-	Seeds []string `mapstructure:"seeds"`
+	Seeds            []string `mapstructure:"seeds"`
+	DatahubDiscovery bool     `mapstructure:"datahub_discovery"`
+	ListenPort       int      `mapstructure:"listen_port"`
+	BootstrapPeers   []string `mapstructure:"bootstrap_peers"`
+	DHTMode          string   `mapstructure:"dht_mode"`
+	StoragePath      string   `mapstructure:"storage_path"`
+	EnableMDNS       bool     `mapstructure:"enable_mdns"`
+	AllowPrivateURLs bool     `mapstructure:"allow_private_urls"`
 }
 
 type HealthConfig struct {
@@ -139,7 +202,23 @@ type PropagationConfig struct {
 	// Teranode rejects oversized batches with "too many transactions" (400),
 	// which previously cascaded into a 1k+ per-tx fallback storm. Splitting
 	// into chunks keeps the batch endpoint in play even under Kafka backlog.
-	TeranodeMaxBatchSize int `mapstructure:"teranode_max_batch_size"`
+	TeranodeMaxBatchSize int                  `mapstructure:"teranode_max_batch_size"`
+	EndpointHealth       EndpointHealthConfig `mapstructure:"endpoint_health"`
+}
+
+// EndpointHealthConfig tunes the per-endpoint circuit-breaker in teranode.Client.
+// FailureThreshold is the number of consecutive failures before an endpoint is
+// marked unhealthy and excluded from broadcasts. ProbeIntervalMs is how often
+// the recovery probe runs against the unhealthy set; ProbeTimeoutMs bounds each
+// probe request. MinHealthyEndpoints is an advisory warning threshold — when
+// the healthy count drops below it a single WARN is logged, but broadcasts are
+// never blocked by this value. Zero or negative values fall back to the
+// documented defaults at client construction time.
+type EndpointHealthConfig struct {
+	FailureThreshold    int `mapstructure:"failure_threshold"`
+	ProbeIntervalMs     int `mapstructure:"probe_interval_ms"`
+	ProbeTimeoutMs      int `mapstructure:"probe_timeout_ms"`
+	MinHealthyEndpoints int `mapstructure:"min_healthy_endpoints"`
 }
 
 // BumpBuilderConfig controls the BUMP construction workflow. GraceWindowMs is the
@@ -232,6 +311,18 @@ func setDefaults() {
 	// automatically moves the lease TTL unless the operator opts into a fixed value.
 	viper.SetDefault("propagation.lease_ttl_ms", 0)
 	viper.SetDefault("propagation.teranode_max_batch_size", 100)
+	viper.SetDefault("propagation.endpoint_health.failure_threshold", 3)
+	viper.SetDefault("propagation.endpoint_health.probe_interval_ms", 30000)
+	viper.SetDefault("propagation.endpoint_health.probe_timeout_ms", 2000)
+	viper.SetDefault("propagation.endpoint_health.min_healthy_endpoints", 0)
+
+	viper.SetDefault("network", NetworkMainnet)
+
+	viper.SetDefault("p2p.datahub_discovery", false)
+	viper.SetDefault("p2p.listen_port", 9905)
+	viper.SetDefault("p2p.dht_mode", "off")
+	viper.SetDefault("p2p.enable_mdns", false)
+	viper.SetDefault("p2p.allow_private_urls", false)
 
 	viper.SetDefault("storage_path", "~/.arcade")
 	viper.SetDefault("chaintracks_server.enabled", true)
@@ -268,6 +359,13 @@ func validate(cfg *Config) error {
 		}
 	default:
 		return fmt.Errorf("unknown store.backend %q (expected aerospike, pebble, or postgres)", cfg.Store.Backend)
+	}
+	if cfg.Network == "" {
+		cfg.Network = NetworkMainnet
+	}
+	if _, ok := knownNetworks[cfg.Network]; !ok {
+		return fmt.Errorf("invalid network %q (expected %s, %s, or %s)",
+			cfg.Network, NetworkMainnet, NetworkTestnet, NetworkTeratestnet)
 	}
 	validModes := map[string]bool{
 		"all": true, "api-server": true,
