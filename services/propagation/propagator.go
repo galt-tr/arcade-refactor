@@ -297,6 +297,13 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 // open thousands of sockets at once.
 const maxParallelChunks = 4
 
+// fallbackParallelism caps concurrent per-tx broadcasts when an all-rejected
+// chunk falls back to per-tx classification. Each single-tx broadcast already
+// fans out across endpoints, so the effective in-flight count per chunk is
+// fallbackParallelism × len(endpoints). Sized to keep a single failing chunk
+// from monopolising the HTTP client's connection pool.
+const fallbackParallelism = 8
+
 // broadcastInChunks splits a batch into teranodeBatchCap-sized chunks and
 // broadcasts each via /txs, falling back to per-tx /tx within a chunk only
 // when that chunk's batch broadcast is all-rejected. Chunks run in parallel
@@ -373,23 +380,40 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 
 	// Fallback: per-tx classification for this chunk only. Summarise instead
 	// of logging per call — one line per fallback, not N.
+	//
+	// Cap concurrency so a 100-tx chunk in all-rejected state doesn't spawn
+	// 100 goroutines × N endpoints of in-flight HTTP requests at once. Each
+	// single-tx broadcast already fans out across endpoints internally.
 	var accepted, rejected, retryable int
+	var mu sync.Mutex
+	sem := make(chan struct{}, fallbackParallelism)
+	var wg sync.WaitGroup
 	for i, msg := range chunk {
-		br := p.broadcastSingleToEndpoints(ctx, rawTxs[i], msg.TXID)
-		out[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: msg.RawTx, successEndpoint: br.SuccessEndpoint}
-		switch {
-		case br.Status == nil:
-			// no verdict (202 or all timed out)
-		case br.Status.Status == models.StatusAcceptedByNetwork:
-			accepted++
-		case br.Status.Status == models.StatusRejected:
-			if IsRetryableError(br.ErrorMsg) {
-				retryable++
-			} else {
-				rejected++
+		i, msg := i, msg
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			br := p.broadcastSingleToEndpoints(ctx, rawTxs[i], msg.TXID)
+			out[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: msg.RawTx, successEndpoint: br.SuccessEndpoint}
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case br.Status == nil:
+				// no verdict (202 or all timed out)
+			case br.Status.Status == models.StatusAcceptedByNetwork:
+				accepted++
+			case br.Status.Status == models.StatusRejected:
+				if IsRetryableError(br.ErrorMsg) {
+					retryable++
+				} else {
+					rejected++
+				}
 			}
-		}
+		}()
 	}
+	wg.Wait()
 	p.logger.Info("per-tx fallback complete",
 		zap.Int("chunk_size", len(chunk)),
 		zap.Int("accepted", accepted),
