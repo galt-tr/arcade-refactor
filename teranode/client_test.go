@@ -25,7 +25,7 @@ func TestSubmitTransaction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL}, "testtoken")
+	client := NewClient([]string{server.URL}, "testtoken", HealthConfig{})
 	rawTx := []byte{0x01, 0x02, 0x03}
 
 	code, err := client.SubmitTransaction(context.Background(), server.URL, rawTx)
@@ -59,7 +59,7 @@ func TestSubmitTransactions_Batch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient([]string{server.URL}, "")
+	client := NewClient([]string{server.URL}, "", HealthConfig{})
 	rawTxs := [][]byte{{0x01, 0x02}, {0x03, 0x04, 0x05}}
 
 	code, err := client.SubmitTransactions(context.Background(), server.URL, rawTxs)
@@ -77,7 +77,7 @@ func TestSubmitTransactions_Batch(t *testing.T) {
 
 func TestGetEndpoints(t *testing.T) {
 	endpoints := []string{"http://a", "http://b", "http://c"}
-	client := NewClient(endpoints, "")
+	client := NewClient(endpoints, "", HealthConfig{})
 	got := client.GetEndpoints()
 	if len(got) != 3 {
 		t.Errorf("expected 3 endpoints, got %d", len(got))
