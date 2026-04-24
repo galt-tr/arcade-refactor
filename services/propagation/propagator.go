@@ -29,8 +29,11 @@ import (
 const reaperLeaseName = "propagation-reaper"
 
 type propagationMsg struct {
-	TXID  string `json:"txid"`
-	RawTx string `json:"raw_tx"`
+	TXID string `json:"txid"`
+	// RawTx is the serialized transaction as raw bytes. encoding/json encodes
+	// []byte as base64 — still smaller than hex (4/3 expansion vs 2x) and
+	// avoids the per-hop hex encode/decode the pipeline used to do.
+	RawTx []byte `json:"raw_tx"`
 }
 
 type Propagator struct {
@@ -174,9 +177,8 @@ func (p *Propagator) handleMessage(ctx context.Context, msg *kafka.Message) erro
 		return fmt.Errorf("unmarshaling propagation message: %w", err)
 	}
 
-	// Validate hex before accumulating
-	if _, err := hex.DecodeString(propMsg.RawTx); err != nil {
-		return fmt.Errorf("decoding raw tx hex: %w", err)
+	if len(propMsg.RawTx) == 0 {
+		return fmt.Errorf("propagation message has empty raw_tx")
 	}
 
 	p.mu.Lock()
@@ -213,7 +215,7 @@ func (p *Propagator) flushBatch(ctx context.Context) error {
 type txResult struct {
 	status          *models.TransactionStatus
 	errMsg          string
-	rawTxHex        string
+	rawTx           []byte
 	successEndpoint string
 }
 
@@ -254,8 +256,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 	// oversized Kafka flush doesn't blow past Teranode's /txs size limit.
 	rawTxs := make([][]byte, len(batch))
 	for i, msg := range batch {
-		rawTx, _ := hex.DecodeString(msg.RawTx) // already validated in handleMessage
-		rawTxs[i] = rawTx
+		rawTxs[i] = msg.RawTx
 	}
 	results := p.broadcastInChunks(ctx, batch, rawTxs)
 
@@ -273,7 +274,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 			continue
 		}
 		if res.status.Status == models.StatusRejected && IsRetryableError(res.errMsg) {
-			p.handleRetryableFailure(ctx, batch[i].TXID, res.rawTxHex)
+			p.handleRetryableFailure(ctx, batch[i].TXID, res.rawTx)
 			continue
 		}
 		if err := p.store.UpdateStatus(ctx, res.status); err != nil {
@@ -359,7 +360,7 @@ func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationM
 func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg, rawTxs [][]byte, out []txResult) {
 	if len(chunk) == 1 {
 		br := p.broadcastSingleToEndpoints(ctx, rawTxs[0], chunk[0].TXID)
-		out[0] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: chunk[0].RawTx, successEndpoint: br.SuccessEndpoint}
+		out[0] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTx: chunk[0].RawTx, successEndpoint: br.SuccessEndpoint}
 		return
 	}
 
@@ -373,7 +374,7 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 	}
 	if !allRejected {
 		for i, s := range batchStatuses {
-			out[i] = txResult{status: s, rawTxHex: chunk[i].RawTx, successEndpoint: batchSuccessEndpoint}
+			out[i] = txResult{status: s, rawTx: chunk[i].RawTx, successEndpoint: batchSuccessEndpoint}
 		}
 		return
 	}
@@ -396,7 +397,7 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 			defer wg.Done()
 			defer func() { <-sem }()
 			br := p.broadcastSingleToEndpoints(ctx, rawTxs[i], msg.TXID)
-			out[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTxHex: msg.RawTx, successEndpoint: br.SuccessEndpoint}
+			out[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTx: msg.RawTx, successEndpoint: br.SuccessEndpoint}
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -693,13 +694,7 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 // exponential backoff from the post-increment count without double-
 // incrementing. If retry_count exceeds retryMaxAttempts, the tx is rejected
 // immediately and its retry bins are cleared.
-func (p *Propagator) handleRetryableFailure(ctx context.Context, txid, rawTxHex string) {
-	rawTx, err := hex.DecodeString(rawTxHex)
-	if err != nil {
-		p.logger.Error("invalid raw tx hex on retry", zap.String("txid", txid), zap.Error(err))
-		return
-	}
-
+func (p *Propagator) handleRetryableFailure(ctx context.Context, txid string, rawTx []byte) {
 	retryCount, err := p.store.BumpRetryCount(ctx, txid)
 	if err != nil {
 		p.logger.Error("failed to bump retry count", zap.String("txid", txid), zap.Error(err))

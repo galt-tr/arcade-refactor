@@ -340,10 +340,14 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// to one Kafka partition, so any re-submission (retry, user double-post)
 	// lands on the same consumer — a future idempotency check can then see the
 	// duplicate instead of having it fan out across replicas.
+	//
+	// Raw tx bytes travel as []byte in the JSON payload (encoded as base64 by
+	// encoding/json) so the validator and propagator never hex-decode the body
+	// and re-encode it downstream.
 	txid := computeTxID(rawTx)
 	msg := map[string]interface{}{
 		"action": "submit",
-		"raw_tx": hex.EncodeToString(rawTx),
+		"raw_tx": rawTx,
 	}
 	if err := s.producer.Send(kafka.TopicTransaction, txid, msg); err != nil {
 		s.logger.Error("failed to publish transaction", zap.Error(err))
@@ -396,7 +400,7 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 			Key: computeTxID(rawTxBytes),
 			Value: map[string]interface{}{
 				"action": "submit",
-				"raw_tx": hex.EncodeToString(rawTxBytes),
+				"raw_tx": rawTxBytes,
 			},
 		})
 		offset += bytesUsed

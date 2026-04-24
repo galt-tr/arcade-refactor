@@ -255,7 +255,7 @@ func (m *mockStore) lastUpdateForTxid(txid string) *models.TransactionStatus {
 func makePropMsg(txid string) []byte {
 	msg := propagationMsg{
 		TXID:  txid,
-		RawTx: "deadbeef",
+		RawTx: []byte{0xde, 0xad, 0xbe, 0xef},
 	}
 	b, _ := json.Marshal(msg)
 	return b

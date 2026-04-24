@@ -2,7 +2,6 @@ package propagation
 
 import (
 	"context"
-	"encoding/hex"
 	"time"
 
 	"go.uber.org/zap"
@@ -79,7 +78,7 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 	batch := make([]propagationMsg, len(ready))
 	for i, r := range ready {
 		rawTxs[i] = r.RawTx
-		batch[i] = propagationMsg{TXID: r.TxID, RawTx: hex.EncodeToString(r.RawTx)}
+		batch[i] = propagationMsg{TXID: r.TxID, RawTx: r.RawTx}
 	}
 
 	// Reuse the same chunk-and-fallback path as processBatch — the retry
@@ -117,7 +116,7 @@ func (p *Propagator) resolveRetryOutcome(ctx context.Context, entry *store.Pendi
 
 	if res.status != nil && res.status.Status == models.StatusRejected {
 		if IsRetryableError(res.errMsg) {
-			p.handleRetryableFailure(ctx, entry.TxID, hex.EncodeToString(entry.RawTx))
+			p.handleRetryableFailure(ctx, entry.TxID, entry.RawTx)
 			return
 		}
 		if err := p.store.ClearRetryState(ctx, entry.TxID, models.StatusRejected, res.errMsg); err != nil {

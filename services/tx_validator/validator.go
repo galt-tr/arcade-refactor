@@ -2,7 +2,6 @@ package tx_validator
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -74,7 +73,10 @@ func (v *Validator) Stop() error {
 
 type txMessage struct {
 	Action string `json:"action,omitempty"`
-	RawTx  string `json:"raw_tx,omitempty"`
+	// RawTx carries the serialized transaction as raw bytes. encoding/json
+	// encodes []byte as base64 on the wire, so we avoid the hex round-trip
+	// that used to happen at every pipeline hop.
+	RawTx []byte `json:"raw_tx,omitempty"`
 }
 
 func (v *Validator) handleMessage(ctx context.Context, msg *kafka.Message) error {
@@ -83,7 +85,7 @@ func (v *Validator) handleMessage(ctx context.Context, msg *kafka.Message) error
 		return fmt.Errorf("unmarshaling message: %w", err)
 	}
 
-	if txMsg.Action == "submit" && txMsg.RawTx != "" {
+	if txMsg.Action == "submit" && len(txMsg.RawTx) > 0 {
 		return v.handleNewTransaction(ctx, txMsg)
 	}
 
@@ -92,10 +94,7 @@ func (v *Validator) handleMessage(ctx context.Context, msg *kafka.Message) error
 }
 
 func (v *Validator) handleNewTransaction(ctx context.Context, msg txMessage) error {
-	rawBytes, err := hex.DecodeString(msg.RawTx)
-	if err != nil {
-		return fmt.Errorf("decoding hex tx: %w", err)
-	}
+	rawBytes := msg.RawTx
 
 	// Parse transaction using go-sdk (BEEF first, then raw bytes)
 	var tx *sdkTx.Transaction
@@ -154,7 +153,11 @@ func (v *Validator) handleNewTransaction(ctx context.Context, msg txMessage) err
 	// so the batch naturally matches what the client submitted.
 	v.mu.Lock()
 	v.pendingProps = append(v.pendingProps, kafka.KeyValue{
-		Value: map[string]string{"txid": txid, "raw_tx": msg.RawTx},
+		Key: txid,
+		Value: map[string]interface{}{
+			"txid":   txid,
+			"raw_tx": rawBytes,
+		},
 	})
 	v.mu.Unlock()
 

@@ -47,7 +47,8 @@ func makeValidTxHex() string {
 }
 
 func makeTxMsg(rawTxHex string) []byte {
-	msg := txMessage{Action: "submit", RawTx: rawTxHex}
+	rawTx, _ := hex.DecodeString(rawTxHex)
+	msg := txMessage{Action: "submit", RawTx: rawTx}
 	b, _ := json.Marshal(msg)
 	return b
 }
