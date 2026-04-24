@@ -429,13 +429,53 @@ type broadcastResult struct {
 	SuccessEndpoint string // URL of the peer that accepted the tx (empty if none did)
 }
 
+// inlineRetryAttempts is the number of *additional* attempts to make after
+// the first broadcast fails with a retryable error. Total attempts therefore
+// are inlineRetryAttempts+1. Kept small because each attempt already fans out
+// across all healthy endpoints; the goal is to ride out transient network
+// blips without waiting the full reaper_interval for PENDING_RETRY.
+const inlineRetryAttempts = 2
+
+// inlineRetryDelay is the base sleep between inline retry attempts.
+var inlineRetryDelay = 100 * time.Millisecond
+
 // broadcastSingleToEndpoints submits a single transaction to each healthy
 // teranode endpoint using POST /tx. On the first accepting endpoint (200 OK)
 // the shared broadcast context is cancelled so slower sibling requests don't
 // gate wall-time on the slowest peer. Per-endpoint outcomes are recorded into
 // the teranode client's circuit-breaker so repeatedly failing peers are
 // sidelined from future broadcasts.
+//
+// Transient all-failure broadcasts (every endpoint returned a retryable error)
+// are retried inline up to inlineRetryAttempts times before returning, so a
+// brief network blip doesn't force a 30s PENDING_RETRY trip.
 func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byte, txid string) broadcastResult {
+	var result broadcastResult
+	for attempt := 0; attempt <= inlineRetryAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return result
+			case <-time.After(time.Duration(attempt) * inlineRetryDelay):
+			}
+		}
+		result = p.broadcastSingleOnce(ctx, rawTx, txid)
+		// Accepted (200) or no-verdict (202/all timeouts) — no point retrying.
+		if result.SuccessEndpoint != "" || result.Status == nil {
+			return result
+		}
+		// Only retry if the aggregate outcome looks transient. Non-retryable
+		// rejections are terminal and stay terminal.
+		if !IsRetryableError(result.ErrorMsg) {
+			return result
+		}
+	}
+	return result
+}
+
+// broadcastSingleOnce is one attempt of a single-tx broadcast. Split out so
+// broadcastSingleToEndpoints can loop around it for inline retries.
+func (p *Propagator) broadcastSingleOnce(ctx context.Context, rawTx []byte, txid string) broadcastResult {
 	endpoints := p.teranodeClient.GetHealthyEndpoints()
 	if len(endpoints) == 0 {
 		p.logger.Error("no healthy teranode endpoints")

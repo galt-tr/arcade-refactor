@@ -866,9 +866,15 @@ func TestRetry_MissingInputs_ThenReaperSuccess(t *testing.T) {
 	ms := newMockStore()
 	failCount := &atomic.Int32{}
 
-	// First call returns "missing inputs", subsequent calls succeed.
-	teranodeSrv := newTeranodeServerToggle(failCount, 1, "missing inputs for tx")
+	// Fail enough times to exhaust the inline retry (1 + inlineRetryAttempts),
+	// so the tx lands in PENDING_RETRY; the reaper's rebroadcast then succeeds.
+	teranodeSrv := newTeranodeServerToggle(failCount, int32(1+inlineRetryAttempts), "missing inputs for tx")
 	defer teranodeSrv.Close()
+
+	// Speed up the inline retry delays for the test.
+	origDelay := inlineRetryDelay
+	inlineRetryDelay = 0
+	defer func() { inlineRetryDelay = origDelay }()
 
 	p := newPropagator("", teranodeSrv.URL, ms)
 
