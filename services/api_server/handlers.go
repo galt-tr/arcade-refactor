@@ -261,9 +261,20 @@ func (s *Server) handleGetTransaction(c *gin.Context) {
 	c.JSON(http.StatusOK, status)
 }
 
+// Per-request body size caps for the submit endpoints. A BSV transaction can
+// legally be quite large, but at the API boundary we want a hard upper bound
+// so a single client can't exhaust memory with a crafted body. Sized for a
+// generous single transaction and a generous batch.
+const (
+	maxSingleTxBytes = 32 << 20  // 32 MiB per single-tx submit
+	maxBatchBytes    = 256 << 20 // 256 MiB per batch submit
+)
+
 // handleSubmitTransaction accepts transactions for validation and propagation.
 // Supports application/octet-stream, text/plain (hex), and JSON.
 func (s *Server) handleSubmitTransaction(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxSingleTxBytes)
+
 	var rawTx []byte
 
 	contentType := c.ContentType()
@@ -329,6 +340,8 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Content-Type must be application/octet-stream"})
 		return
 	}
+
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBatchBytes)
 
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
