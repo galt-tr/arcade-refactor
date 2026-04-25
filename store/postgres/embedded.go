@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
-	"strings"
 
 	embedded "github.com/fergusstrange/embedded-postgres"
 
@@ -21,18 +19,10 @@ import (
 //
 // Returns the DSN the pgx pool should use, plus a stop func.
 func startEmbedded(cfg config.Postgres) (dsn string, stop func() error, err error) {
-	dataDir, err := expandHome(cfg.EmbeddedDataDir)
-	if err != nil {
-		return "", nil, err
-	}
-	cacheDir, err := expandHome(cfg.EmbeddedCacheDir)
-	if err != nil {
-		return "", nil, err
-	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.EmbeddedDataDir, 0o755); err != nil {
 		return "", nil, fmt.Errorf("creating embedded postgres data dir: %w", err)
 	}
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.EmbeddedCacheDir, 0o755); err != nil {
 		return "", nil, fmt.Errorf("creating embedded postgres cache dir: %w", err)
 	}
 
@@ -63,9 +53,9 @@ func startEmbedded(cfg config.Postgres) (dsn string, stop func() error, err erro
 		Password(pass).
 		Database(db).
 		Port(port).
-		DataPath(dataDir).
-		RuntimePath(cacheDir).
-		BinariesPath(cacheDir),
+		DataPath(cfg.EmbeddedDataDir).
+		RuntimePath(cfg.EmbeddedCacheDir).
+		BinariesPath(cfg.EmbeddedCacheDir),
 	)
 	if err := ep.Start(); err != nil {
 		return "", nil, fmt.Errorf("start embedded postgres on port %d: %w", port, err)
@@ -88,13 +78,3 @@ func pickFreePort() (uint32, error) {
 	return uint32(l.Addr().(*net.TCPAddr).Port), nil
 }
 
-func expandHome(path string) (string, error) {
-	if !strings.HasPrefix(path, "~") {
-		return path, nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, strings.TrimPrefix(path, "~")), nil
-}

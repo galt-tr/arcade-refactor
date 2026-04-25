@@ -90,16 +90,10 @@ func (s *Server) initChaintracks(ctx context.Context) error {
 	}
 
 	// Default chaintracks storage to <storage_path>/chaintracks/ so operators
-	// only need to set a single storage root in the common case.
+	// only need to set a single storage root in the common case. Tilde expansion
+	// happens in config.Load, so root is already a real filesystem path here.
 	if s.cfg.Chaintracks.StoragePath == "" {
 		root := s.cfg.StoragePath
-		if len(root) >= 2 && root[:2] == "~/" {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return fmt.Errorf("resolving home directory for storage_path: %w", err)
-			}
-			root = path.Join(home, root[2:])
-		}
 		if root == "" {
 			root = "."
 		}

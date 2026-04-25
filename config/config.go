@@ -2,12 +2,30 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	chaintracksconfig "github.com/bsv-blockchain/go-chaintracks/config"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
+
+// ExpandHome rewrites a leading "~" or "~/" to the current user's home dir.
+// Other paths (absolute, relative, or empty) are returned unchanged. Centralised
+// so every config consumer sees real filesystem paths instead of literal tildes —
+// libraries like cockroachdb/pebble don't expand "~" themselves and will happily
+// create a directory named "~" in cwd.
+func ExpandHome(path string) (string, error) {
+	if path == "" || !strings.HasPrefix(path, "~") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, strings.TrimPrefix(path, "~")), nil
+}
 
 // Canonical network names accepted at the top-level `network` config key.
 // These are the only values operators ever type; internal mapping to the
@@ -293,11 +311,36 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		return nil, fmt.Errorf("unmarshaling config: %w", err)
 	}
 
+	if err := expandPaths(&cfg); err != nil {
+		return nil, err
+	}
+
 	if err := validate(&cfg); err != nil {
 		return nil, err
 	}
 
 	return &cfg, nil
+}
+
+// expandPaths resolves "~/..." in every filesystem path the config exposes,
+// so downstream consumers (pebble, postgres, chaintracks, p2p) never see a
+// literal tilde. New path fields should be added here.
+func expandPaths(cfg *Config) error {
+	for _, p := range []*string{
+		&cfg.StoragePath,
+		&cfg.Store.Pebble.Path,
+		&cfg.Store.Postgres.EmbeddedDataDir,
+		&cfg.Store.Postgres.EmbeddedCacheDir,
+		&cfg.P2P.StoragePath,
+		&cfg.Chaintracks.StoragePath,
+	} {
+		expanded, err := ExpandHome(*p)
+		if err != nil {
+			return fmt.Errorf("expanding path %q: %w", *p, err)
+		}
+		*p = expanded
+	}
+	return nil
 }
 
 func setDefaults() {
