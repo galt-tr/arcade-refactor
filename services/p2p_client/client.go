@@ -28,6 +28,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
@@ -202,8 +203,11 @@ func (c *Client) consume(ctx context.Context, msgs <-chan teranodep2p.NodeStatus
 // wrapper library has already JSON-decoded the payload; spoofing defense is
 // left to the libp2p layer since the wrapper drops FromID before fan-out.
 func (c *Client) handleNodeStatus(msg teranodep2p.NodeStatusMessage) {
+	metrics.P2PNodeStatusMessagesTotal.Inc()
+
 	raw := pickDatahubURL(msg)
 	if raw == "" {
+		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("no_url").Inc()
 		c.logger.Debug("node_status has no datahub url",
 			zap.String("peer_id", msg.PeerID),
 		)
@@ -212,6 +216,7 @@ func (c *Client) handleNodeStatus(msg teranodep2p.NodeStatusMessage) {
 
 	normalized, err := validateURL(raw, c.cfg.P2P.AllowPrivateURLs)
 	if err != nil {
+		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("invalid").Inc()
 		c.logger.Warn("rejected discovered datahub url",
 			zap.String("peer_id", msg.PeerID),
 			zap.String("url", raw),
@@ -221,6 +226,11 @@ func (c *Client) handleNodeStatus(msg teranodep2p.NodeStatusMessage) {
 	}
 
 	added := c.teranode.AddEndpoints([]string{normalized})
+	if added == 0 {
+		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("duplicate").Inc()
+	} else {
+		metrics.P2PEndpointDiscoveryTotal.WithLabelValues("registered").Inc()
+	}
 	if added == 1 {
 		eps := c.teranode.GetEndpoints()
 		c.logger.Info("registered peer datahub url",

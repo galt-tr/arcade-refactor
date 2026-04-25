@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/merkleservice"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -237,6 +238,8 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 		zap.Strings("txids_sample", txidSample),
 	)
 
+	metrics.PropagationBatchSize.Observe(float64(len(batch)))
+
 	// Step 1: Register all txids with merkle service (mandatory)
 	if p.merkleClient != nil && p.cfg.CallbackURL != "" {
 		regs := make([]merkleservice.Registration, len(batch))
@@ -246,9 +249,12 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 				CallbackURL: p.cfg.CallbackURL,
 			}
 		}
+		mStart := time.Now()
 		if err := p.merkleClient.RegisterBatch(ctx, regs, p.merkleConcurrency); err != nil {
+			metrics.PropagationMerkleRegisterDuration.Observe(time.Since(mStart).Seconds())
 			return fmt.Errorf("merkle-service batch registration failed: %w", err)
 		}
+		metrics.PropagationMerkleRegisterDuration.Observe(time.Since(mStart).Seconds())
 		p.logger.Debug("batch registered with merkle-service", zap.Int("count", len(batch)))
 	}
 
@@ -263,6 +269,7 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 	// Step 3: Update status for each transaction, with retry classification
 	seenEndpoints := make(map[string]struct{})
 	var successEndpoints []string
+	var accepted, rejected, retryable, noVerdict int
 	for i, res := range results {
 		if res.successEndpoint != "" {
 			if _, ok := seenEndpoints[res.successEndpoint]; !ok {
@@ -271,11 +278,19 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 			}
 		}
 		if res.status == nil {
+			noVerdict++
 			continue
 		}
 		if res.status.Status == models.StatusRejected && IsRetryableError(res.errMsg) {
+			retryable++
 			p.handleRetryableFailure(ctx, batch[i].TXID, res.rawTx)
 			continue
+		}
+		switch res.status.Status {
+		case models.StatusAcceptedByNetwork:
+			accepted++
+		case models.StatusRejected:
+			rejected++
 		}
 		if err := p.store.UpdateStatus(ctx, res.status); err != nil {
 			p.logger.Error("failed to update status",
@@ -284,6 +299,10 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) e
 			)
 		}
 	}
+	metrics.PropagationOutcomeTotal.WithLabelValues("accepted").Add(float64(accepted))
+	metrics.PropagationOutcomeTotal.WithLabelValues("rejected").Add(float64(rejected))
+	metrics.PropagationOutcomeTotal.WithLabelValues("retryable").Add(float64(retryable))
+	metrics.PropagationOutcomeTotal.WithLabelValues("no_verdict").Add(float64(noVerdict))
 
 	p.logger.Info("batch propagated",
 		zap.Int("count", len(batch)),
@@ -359,6 +378,7 @@ func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationM
 // line to avoid flooding the log with one entry per transaction.
 func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg, rawTxs [][]byte, out []txResult) {
 	if len(chunk) == 1 {
+		metrics.PropagationChunkTotal.WithLabelValues("none").Inc()
 		br := p.broadcastSingleToEndpoints(ctx, rawTxs[0], chunk[0].TXID)
 		out[0] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTx: chunk[0].RawTx, successEndpoint: br.SuccessEndpoint}
 		return
@@ -373,11 +393,13 @@ func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg,
 		}
 	}
 	if !allRejected {
+		metrics.PropagationChunkTotal.WithLabelValues("none").Inc()
 		for i, s := range batchStatuses {
 			out[i] = txResult{status: s, rawTx: chunk[i].RawTx, successEndpoint: batchSuccessEndpoint}
 		}
 		return
 	}
+	metrics.PropagationChunkTotal.WithLabelValues("per_tx_after_all_rejected").Inc()
 
 	// Fallback: per-tx classification for this chunk only. Summarise instead
 	// of logging per call — one line per fallback, not N.
@@ -452,7 +474,8 @@ var inlineRetryDelay = 100 * time.Millisecond
 // brief network blip doesn't force a 30s PENDING_RETRY trip.
 func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byte, txid string) broadcastResult {
 	var result broadcastResult
-	for attempt := 0; attempt <= inlineRetryAttempts; attempt++ {
+	attempt := 0
+	for ; attempt <= inlineRetryAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -463,6 +486,9 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 		result = p.broadcastSingleOnce(ctx, rawTx, txid)
 		// Accepted (200) or no-verdict (202/all timeouts) — no point retrying.
 		if result.SuccessEndpoint != "" || result.Status == nil {
+			if attempt > 0 {
+				metrics.PropagationInlineRetryTotal.WithLabelValues("recovered").Inc()
+			}
 			return result
 		}
 		// Only retry if the aggregate outcome looks transient. Non-retryable
@@ -471,12 +497,17 @@ func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byt
 			return result
 		}
 	}
+	metrics.PropagationInlineRetryTotal.WithLabelValues("exhausted").Inc()
 	return result
 }
 
 // broadcastSingleOnce is one attempt of a single-tx broadcast. Split out so
 // broadcastSingleToEndpoints can loop around it for inline retries.
 func (p *Propagator) broadcastSingleOnce(ctx context.Context, rawTx []byte, txid string) broadcastResult {
+	start := time.Now()
+	defer func() {
+		metrics.PropagationBroadcastDuration.WithLabelValues("single").Observe(time.Since(start).Seconds())
+	}()
 	endpoints := p.teranodeClient.GetHealthyEndpoints()
 	if len(endpoints) == 0 {
 		p.logger.Error("no healthy teranode endpoints")
@@ -602,6 +633,10 @@ func recordEndpointOutcome(tc *teranode.Client, endpoint string, statusCode int)
 // successEndpoint is the URL of the first peer that accepted the batch (empty
 // if none did) — surfaced so operator logs can show which peer served a batch.
 func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) (statuses []*models.TransactionStatus, successEndpoint string) {
+	start := time.Now()
+	defer func() {
+		metrics.PropagationBroadcastDuration.WithLabelValues("batch").Observe(time.Since(start).Seconds())
+	}()
 	endpoints := p.teranodeClient.GetHealthyEndpoints()
 	if len(endpoints) == 0 {
 		p.logger.Error("no healthy teranode endpoints")

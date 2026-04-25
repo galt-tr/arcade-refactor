@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"github.com/bsv-blockchain/arcade/metrics"
 )
 
 // Producer is the service-facing convenience wrapper over Broker. It takes Go
@@ -27,7 +29,13 @@ func (p *Producer) Send(topic string, key string, value any) error {
 	if err != nil {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
-	return p.broker.Send(context.Background(), topic, key, data)
+	if err := p.broker.Send(context.Background(), topic, key, data); err != nil {
+		metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		return err
+	}
+	metrics.KafkaMessagesTotal.WithLabelValues(topic, "produce").Inc()
+	metrics.KafkaMessageBytes.WithLabelValues(topic, "produce").Observe(float64(len(data)))
+	return nil
 }
 
 // SendAsync JSON-marshals value and publishes fire-and-forget.
@@ -36,19 +44,36 @@ func (p *Producer) SendAsync(topic string, key string, value any) error {
 	if err != nil {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
-	return p.broker.SendAsync(context.Background(), topic, key, data)
+	if err := p.broker.SendAsync(context.Background(), topic, key, data); err != nil {
+		metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		return err
+	}
+	metrics.KafkaMessagesTotal.WithLabelValues(topic, "produce").Inc()
+	metrics.KafkaMessageBytes.WithLabelValues(topic, "produce").Observe(float64(len(data)))
+	return nil
 }
 
 // SendBatch publishes multiple values to the same topic. Each KeyValue.Value
 // is JSON-marshaled before the batch is forwarded to the broker.
 func (p *Producer) SendBatch(topic string, msgs []KeyValue) error {
-	return p.broker.SendBatch(context.Background(), topic, msgs)
+	if err := p.broker.SendBatch(context.Background(), topic, msgs); err != nil {
+		metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		return err
+	}
+	metrics.KafkaMessagesTotal.WithLabelValues(topic, "produce").Add(float64(len(msgs)))
+	return nil
 }
 
 // SendRaw publishes pre-marshalled bytes. Used by consumer DLQ routing so we
 // don't double-encode.
 func (p *Producer) SendRaw(topic, key string, value []byte) error {
-	return p.broker.Send(context.Background(), topic, key, value)
+	if err := p.broker.Send(context.Background(), topic, key, value); err != nil {
+		metrics.KafkaProduceErrors.WithLabelValues(topic).Inc()
+		return err
+	}
+	metrics.KafkaMessagesTotal.WithLabelValues(topic, "produce").Inc()
+	metrics.KafkaMessageBytes.WithLabelValues(topic, "produce").Observe(float64(len(value)))
+	return nil
 }
 
 // Broker returns the underlying broker, used by ConsumerGroup to Subscribe.

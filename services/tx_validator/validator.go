@@ -49,6 +49,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/validator"
@@ -153,7 +154,9 @@ func (v *Validator) handleMessage(_ context.Context, msg *kafka.Message) error {
 
 	v.mu.Lock()
 	v.pending = append(v.pending, pendingTx{rawTx: txMsg.RawTx})
+	depth := len(v.pending)
 	v.mu.Unlock()
+	metrics.TxValidatorPendingDepth.Set(float64(depth))
 	return nil
 }
 
@@ -195,6 +198,7 @@ func (v *Validator) flushValidations(ctx context.Context) error {
 	v.pending = nil
 	hasCarry := len(v.publishCarry) > 0
 	v.mu.Unlock()
+	metrics.TxValidatorPendingDepth.Set(0)
 
 	// Nothing to do means: no fresh messages AND no carry from a prior failed
 	// publish. Returning early here skips the publish phase, so we need to
@@ -204,6 +208,7 @@ func (v *Validator) flushValidations(ctx context.Context) error {
 	}
 
 	start := time.Now()
+	metrics.TxValidatorFlushSize.Observe(float64(len(batch)))
 
 	// Phase 1: parse + txid (parallel).
 	parsed := v.phaseParse(ctx, batch)
@@ -246,9 +251,13 @@ func (v *Validator) flushValidations(ctx context.Context) error {
 			// the Kafka publish to succeed eventually.
 			v.mu.Lock()
 			v.publishCarry = append(publishMsgs, v.publishCarry...)
+			carryDepth := len(v.publishCarry)
 			v.mu.Unlock()
+			metrics.TxValidatorPublishCarryDepth.Set(float64(carryDepth))
+			metrics.TxValidatorFlushDuration.WithLabelValues("publish_failed").Observe(time.Since(start).Seconds())
 			return fmt.Errorf("batch publishing to propagation: %w", err)
 		}
+		metrics.TxValidatorPublishCarryDepth.Set(0)
 	}
 
 	parseFails := 0
@@ -257,6 +266,11 @@ func (v *Validator) flushValidations(ctx context.Context) error {
 			parseFails++
 		}
 	}
+	metrics.TxValidatorOutcomeTotal.WithLabelValues("accepted").Add(float64(len(accepted)))
+	metrics.TxValidatorOutcomeTotal.WithLabelValues("rejected").Add(float64(len(rejects)))
+	metrics.TxValidatorOutcomeTotal.WithLabelValues("duplicate").Add(float64(len(dups)))
+	metrics.TxValidatorOutcomeTotal.WithLabelValues("parse_fail").Add(float64(parseFails))
+	metrics.TxValidatorFlushDuration.WithLabelValues("success").Observe(time.Since(start).Seconds())
 	v.logger.Info("validation flush complete",
 		zap.Int("count", len(batch)),
 		zap.Int("parsed", len(parsed)-parseFails),
@@ -367,6 +381,7 @@ func (v *Validator) phaseDedup(ctx context.Context, parsed []parseResult) (live 
 			})
 			if err != nil {
 				v.logger.Error("dedup store error", zap.String("txid", p.txid), zap.Error(err))
+				metrics.TxValidatorOutcomeTotal.WithLabelValues("store_error").Inc()
 				slots[i] = slot{drop: true}
 				return nil // Don't fail the whole batch on a store hiccup.
 			}

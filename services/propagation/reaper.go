@@ -6,6 +6,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 )
@@ -47,14 +48,20 @@ func (p *Propagator) tryReap(ctx context.Context) {
 	if p.leaser != nil {
 		heldUntil, err := p.leaser.TryAcquireOrRenew(ctx, reaperLeaseName, p.holderID, p.leaseTTL)
 		if err != nil {
+			metrics.PropagationReaperTickTotal.WithLabelValues("lease_error").Inc()
+			metrics.PropagationReaperLease.Set(0)
 			p.logger.Warn("reaper: lease check failed, skipping tick", zap.Error(err))
 			return
 		}
 		if heldUntil.IsZero() {
+			metrics.PropagationReaperTickTotal.WithLabelValues("skipped_no_leader").Inc()
+			metrics.PropagationReaperLease.Set(0)
 			p.logger.Debug("reaper: not leader, skipping tick")
 			return
 		}
+		metrics.PropagationReaperLease.Set(1)
 	}
+	metrics.PropagationReaperTickTotal.WithLabelValues("ran").Inc()
 	p.reapOnce(ctx)
 }
 
@@ -68,6 +75,7 @@ func (p *Propagator) reapOnce(ctx context.Context) {
 		p.logger.Error("reaper: query ready retries failed", zap.Error(err))
 		return
 	}
+	metrics.PropagationReaperReadyDepth.Set(float64(len(ready)))
 	if len(ready) == 0 {
 		return
 	}

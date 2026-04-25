@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type RouteDoc struct {
@@ -64,6 +65,10 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 
 	r.GET("/health", s.handleHealth)
 	r.GET("/ready", s.handleReady)
+	// Prometheus scrape endpoint. Mounted on the API server (in addition to
+	// the per-pod health server) so api-server-only deployments still expose
+	// metrics.
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	r.POST("/api/v1/merkle-service/callback", s.handleCallback)
 	r.GET("/tx/:txid", s.handleGetTransaction)

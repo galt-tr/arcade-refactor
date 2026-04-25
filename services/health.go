@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync/atomic"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -35,6 +36,10 @@ func NewHealthServer(port int, logger *zap.Logger) *HealthServer {
 			w.Write([]byte(`{"status":"not ready"}`))
 		}
 	})
+	// Prometheus scrape endpoint. Uses the default registry the metrics package
+	// registers all its vectors against; promhttp handles content negotiation
+	// (text vs OpenMetrics) and per-collector errors.
+	mux.Handle("/metrics", promhttp.Handler())
 
 	hs.server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),

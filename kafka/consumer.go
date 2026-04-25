@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/bsv-blockchain/arcade/metrics"
 )
 
 // ConsumerGroup is the service-facing consumer wrapper. It owns the
@@ -128,6 +130,8 @@ func (c *ConsumerGroup) handleClaim(claim Claim) error {
 }
 
 func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
+	metrics.KafkaMessagesTotal.WithLabelValues(msg.Topic, "consume").Inc()
+	metrics.KafkaMessageBytes.WithLabelValues(msg.Topic, "consume").Observe(float64(len(msg.Value)))
 	if err := c.processWithRetry(claim.Context(), msg); err != nil {
 		c.sendToDLQ(msg, err)
 	}
@@ -202,6 +206,7 @@ func (c *ConsumerGroup) sendToDLQ(msg *Message, processErr error) {
 		)
 		return
 	}
+	metrics.KafkaMessagesTotal.WithLabelValues(msg.Topic, "dlq").Inc()
 	c.logger.Info("message sent to DLQ",
 		zap.String("dlq_topic", dlqTopic),
 		zap.String("original_topic", msg.Topic),

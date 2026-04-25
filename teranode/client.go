@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/bsv-blockchain/arcade/metrics"
 )
 
 const (
@@ -180,8 +182,27 @@ func NewClient(endpoints []string, authToken string, hc HealthConfig) *Client {
 		c.seen[n] = struct{}{}
 		c.endpoints = append(c.endpoints, n)
 		c.health[n] = &endpointHealth{state: stateHealthy, source: sourceConfigured}
+		metrics.TeranodeEndpointHealth.WithLabelValues(n, "configured").Set(1)
 	}
+	c.refreshEndpointCountMetric()
 	return c
+}
+
+// refreshEndpointCountMetric sets the per-source endpoint count gauges from the
+// current registration state. Caller must hold c.mu (any kind) so it sees a
+// consistent view; the gauge update itself is goroutine-safe.
+func (c *Client) refreshEndpointCountMetric() {
+	var configured, discovered float64
+	for _, h := range c.health {
+		switch h.source {
+		case sourceConfigured:
+			configured++
+		case sourceDiscovered:
+			discovered++
+		}
+	}
+	metrics.TeranodeEndpointCount.WithLabelValues("configured").Set(configured)
+	metrics.TeranodeEndpointCount.WithLabelValues("discovered").Set(discovered)
 }
 
 // Start launches the background probe goroutine and (when an EndpointSource
@@ -288,7 +309,11 @@ func (c *Client) AddEndpoints(urls []string) int {
 		c.seen[n] = struct{}{}
 		c.endpoints = append(c.endpoints, n)
 		c.health[n] = &endpointHealth{state: stateHealthy, source: sourceDiscovered}
+		metrics.TeranodeEndpointHealth.WithLabelValues(n, "discovered").Set(1)
 		added++
+	}
+	if added > 0 {
+		c.refreshEndpointCountMetric()
 	}
 	return added
 }
@@ -307,9 +332,11 @@ func (c *Client) RecordSuccess(url string) {
 	transitioned := h.state == stateUnhealthy
 	h.consecutiveFailures = 0
 	h.state = stateHealthy
+	source := h.source
 	c.recomputeBelowThresholdLocked()
 	c.mu.Unlock()
 	if transitioned {
+		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(1)
 		c.logger.Info("endpoint healthy",
 			zap.String("endpoint", n),
 			zap.String("from", "unhealthy"),
@@ -336,9 +363,11 @@ func (c *Client) RecordFailure(url string) {
 		h.state = stateUnhealthy
 		transitioned = true
 	}
+	source := h.source
 	c.recomputeBelowThresholdLocked()
 	c.mu.Unlock()
 	if transitioned {
+		metrics.TeranodeEndpointHealth.WithLabelValues(n, sourceLabel(source)).Set(0)
 		c.logger.Warn("endpoint unhealthy",
 			zap.String("endpoint", n),
 			zap.Int("consecutive_failures", h.consecutiveFailures),
@@ -346,6 +375,14 @@ func (c *Client) RecordFailure(url string) {
 			zap.String("to", "unhealthy"),
 		)
 	}
+}
+
+// sourceLabel converts the internal healthSource enum to the metric label value.
+func sourceLabel(s healthSource) string {
+	if s == sourceDiscovered {
+		return "discovered"
+	}
+	return "configured"
 }
 
 // GetEndpoints returns a snapshot of the current endpoint list. The returned
@@ -478,29 +515,41 @@ func (c *Client) probeOnce(ctx context.Context) {
 // as reachable regardless of status code; a transport error or context
 // timeout counts as a failure.
 func (c *Client) probeEndpoint(ctx context.Context, endpoint string) {
+	start := time.Now()
 	probeCtx, cancel := context.WithTimeout(ctx, c.probeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, endpoint+"/health", nil)
 	if err != nil {
+		observeRequest("probe", 0, start)
 		c.RecordFailure(endpoint)
 		return
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		observeRequest("probe", 0, start)
 		c.RecordFailure(endpoint)
 		return
 	}
+	observeRequest("probe", resp.StatusCode, start)
 	drainAndClose(resp.Body)
 	c.RecordSuccess(endpoint)
+}
+
+// observeRequest records latency + status class for an outbound HTTP request.
+// statusCode == 0 means transport error (no HTTP response).
+func observeRequest(op string, statusCode int, start time.Time) {
+	metrics.TeranodeRequestDuration.WithLabelValues(op, metrics.ObserveStatusClass(statusCode)).Observe(time.Since(start).Seconds())
 }
 
 // SubmitTransaction submits a transaction to a single endpoint
 // Returns the HTTP status code (200 = accepted, 202 = queued)
 func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx []byte) (int, error) {
+	start := time.Now()
 	url := endpoint + "/tx"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawTx))
 	if err != nil {
+		observeRequest("submit_tx", 0, start)
 		return 0, fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -511,9 +560,11 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		observeRequest("submit_tx", 0, start)
 		return 0, fmt.Errorf("failed to submit transaction: %w", err)
 	}
 	defer drainAndClose(resp.Body)
+	defer observeRequest("submit_tx", resp.StatusCode, start)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(resp.Body)
@@ -527,6 +578,7 @@ func (c *Client) SubmitTransaction(ctx context.Context, endpoint string, rawTx [
 // The raw transaction bytes are concatenated into a single body and POSTed to /txs.
 // Returns the HTTP status code on success.
 func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs [][]byte) (int, error) {
+	start := time.Now()
 	// Calculate total size for pre-allocation
 	totalSize := 0
 	for _, tx := range rawTxs {
@@ -542,6 +594,7 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
+		observeRequest("submit_txs", 0, start)
 		return 0, fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -552,9 +605,11 @@ func (c *Client) SubmitTransactions(ctx context.Context, endpoint string, rawTxs
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		observeRequest("submit_txs", 0, start)
 		return 0, fmt.Errorf("failed to submit transactions: %w", err)
 	}
 	defer drainAndClose(resp.Body)
+	defer observeRequest("submit_txs", resp.StatusCode, start)
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)

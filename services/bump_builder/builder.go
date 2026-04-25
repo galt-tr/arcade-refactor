@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/arcade/bump"
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
@@ -75,13 +76,24 @@ func (b *Builder) Stop() error {
 }
 
 func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
+	overallStart := time.Now()
+	metrics.BumpBuilderBlocksProcessedTotal.Inc()
+	// outcome reflects the terminal disposition of this BLOCK_PROCESSED. Set
+	// before each return so the duration histogram lands in the right bucket.
+	outcome := "success"
+	defer func() {
+		metrics.BumpBuilderBuildDuration.WithLabelValues(outcome).Observe(time.Since(overallStart).Seconds())
+	}()
+
 	var callback models.CallbackMessage
 	if err := json.Unmarshal(msg.Value, &callback); err != nil {
+		outcome = "parse_failed"
 		return fmt.Errorf("unmarshaling block processed message: %w", err)
 	}
 
 	blockHash := callback.BlockHash
 	if blockHash == "" {
+		outcome = "parse_failed"
 		return fmt.Errorf("empty block hash in block_processed message")
 	}
 
@@ -91,9 +103,11 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// of each STUMP before releasing BLOCK_PROCESSED. STUMPs that got a 5xx on the
 	// first attempt retry asynchronously and may land after BLOCK_PROCESSED.
 	if grace := time.Duration(b.cfg.BumpBuilder.GraceWindowMs) * time.Millisecond; grace > 0 {
+		metrics.BumpBuilderGraceWaitTotal.Inc()
 		logger.Debug("waiting grace window", zap.Duration("duration", grace))
 		select {
 		case <-ctx.Done():
+			outcome = "context_cancelled"
 			return ctx.Err()
 		case <-time.After(grace):
 		}
@@ -102,10 +116,13 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	// 1. Get all STUMPs for this block
 	stumps, err := b.store.GetStumpsByBlockHash(ctx, blockHash)
 	if err != nil {
+		outcome = "store_failed"
 		return fmt.Errorf("getting STUMPs for block: %w", err)
 	}
 
+	metrics.BumpBuilderStumpCount.Observe(float64(len(stumps)))
 	if len(stumps) == 0 {
+		outcome = "no_stumps"
 		logger.Info("no STUMPs found — block has no tracked transactions, skipping BUMP construction")
 		return nil
 	}
@@ -124,8 +141,11 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 		endpoints = b.teranode.GetEndpoints()
 	}
 	logger.Debug("fetching block data from datahub", zap.Strings("datahub_urls", endpoints))
+	fetchStart := time.Now()
 	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMP(ctx, endpoints, blockHash, logger)
+	metrics.BumpBuilderDatahubFetchDuration.Observe(time.Since(fetchStart).Seconds())
 	if err != nil {
+		outcome = "fetch_failed"
 		return fmt.Errorf("fetching block data: %w", err)
 	}
 	logger.Debug("datahub fetch succeeded",

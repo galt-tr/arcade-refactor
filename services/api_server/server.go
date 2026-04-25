@@ -14,6 +14,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
@@ -137,9 +138,33 @@ func (s *Server) initChaintracks(ctx context.Context) error {
 
 func (s *Server) requestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		metrics.APIRequestsInFlight.Inc()
+		defer metrics.APIRequestsInFlight.Dec()
+
 		start := time.Now()
 		c.Next()
 		status := c.Writer.Status()
+
+		// Use the matched gin route pattern (not the resolved URL) so /tx/:txid
+		// reports as one bucket regardless of which txid was requested. Falls
+		// back to "unmatched" for routes Gin couldn't resolve.
+		route := c.FullPath()
+		if route == "" {
+			route = "unmatched"
+		}
+		metrics.APIRequestDuration.WithLabelValues(
+			route,
+			c.Request.Method,
+			metrics.ObserveStatusClass(status),
+		).Observe(time.Since(start).Seconds())
+
+		// Request body size — caps cardinality by routing through the route
+		// label rather than per-request. ContentLength is -1 if not set; clamp
+		// to 0 in that case.
+		if reqLen := c.Request.ContentLength; reqLen > 0 {
+			metrics.APIRequestBytes.WithLabelValues(route).Observe(float64(reqLen))
+		}
+
 		fields := []zap.Field{
 			zap.String("method", c.Request.Method),
 			zap.String("path", c.Request.URL.Path),
