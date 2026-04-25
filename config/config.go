@@ -105,6 +105,7 @@ type Config struct {
 	P2P           P2PConfig           `mapstructure:"p2p"`
 	Health        HealthConfig        `mapstructure:"health"`
 	Propagation   PropagationConfig   `mapstructure:"propagation"`
+	TxValidator   TxValidatorConfig   `mapstructure:"tx_validator"`
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
 	// ChaintracksServer gates whether the embedded go-chaintracks HTTP API
 	// runs alongside api-server. Default is on so the refactor is a drop-in
@@ -273,6 +274,15 @@ type EndpointHealthConfig struct {
 // giving merkle-service retries time to land for any STUMPs that initially got a 5xx.
 type BumpBuilderConfig struct {
 	GraceWindowMs int `mapstructure:"grace_window_ms"`
+}
+
+// TxValidatorConfig tunes the parallel batch validation pipeline. Parallelism
+// caps how many transactions are parsed and validated concurrently inside a
+// single flush window — bounded so a huge in-flight batch can't open more
+// goroutines than the host has cores. Zero or negative falls back to
+// runtime.NumCPU at construction time.
+type TxValidatorConfig struct {
+	Parallelism int `mapstructure:"parallelism"`
 }
 
 func BindFlags(cmd *cobra.Command) {
