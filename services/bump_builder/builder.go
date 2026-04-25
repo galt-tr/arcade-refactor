@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/teranode"
 )
 
 type Builder struct {
@@ -25,17 +26,20 @@ type Builder struct {
 	store    store.Store
 	producer *kafka.Producer
 	consumer *kafka.ConsumerGroup
+	teranode *teranode.Client
 }
 
 // New constructs a Builder. producer is the shared process-wide producer —
 // the builder reuses it (for DLQ routing) rather than creating a duplicate
-// connection.
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store) *Builder {
+// connection. teranodeClient supplies the live datahub URL list (static +
+// p2p-discovered, refreshed from the shared store) used for block fetches.
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, st store.Store, teranodeClient *teranode.Client) *Builder {
 	return &Builder{
 		cfg:      cfg,
 		logger:   logger.Named("bump-builder"),
 		store:    st,
 		producer: producer,
+		teranode: teranodeClient,
 	}
 }
 
@@ -109,9 +113,18 @@ func (b *Builder) handleMessage(ctx context.Context, msg *kafka.Message) error {
 	logger.Info("building compound BUMP", zap.Int("stump_count", len(stumps)))
 	logStumpInputs(logger, stumps)
 
-	// 2. Fetch subtree hashes + coinbase BUMP + header merkle root from datahub
-	logger.Debug("fetching block data from datahub", zap.Strings("datahub_urls", b.cfg.DatahubURLs))
-	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMP(ctx, b.cfg.DatahubURLs, blockHash)
+	// 2. Fetch subtree hashes + coinbase BUMP + header merkle root from datahub.
+	// Pull the live URL list from the shared teranode.Client so this picks up
+	// p2p-discovered URLs in addition to statically configured ones. Fall back
+	// to the full set if every endpoint is currently sidelined by the circuit
+	// breaker — better to retry against a sidelined URL than fail with zero
+	// attempts.
+	endpoints := b.teranode.GetHealthyEndpoints()
+	if len(endpoints) == 0 {
+		endpoints = b.teranode.GetEndpoints()
+	}
+	logger.Debug("fetching block data from datahub", zap.Strings("datahub_urls", endpoints))
+	subtreeHashes, coinbaseBUMP, headerMerkleRoot, err := bump.FetchBlockDataForBUMP(ctx, endpoints, blockHash, logger)
 	if err != nil {
 		return fmt.Errorf("fetching block data: %w", err)
 	}

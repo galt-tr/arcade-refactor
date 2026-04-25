@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/arcade/kafka"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/teranode"
 )
 
 // --- Mock Store ---
@@ -250,10 +251,12 @@ func newTestBuilder(st store.Store, datahubURL string) *Builder {
 	cfg := &config.Config{
 		DatahubURLs: []string{datahubURL},
 	}
+	tc := teranode.NewClient([]string{datahubURL}, "", teranode.HealthConfig{})
 	return &Builder{
-		cfg:    cfg,
-		logger: zap.NewNop().Named("bump-builder"),
-		store:  st,
+		cfg:      cfg,
+		logger:   zap.NewNop().Named("bump-builder"),
+		store:    st,
+		teranode: tc,
 	}
 }
 

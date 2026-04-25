@@ -14,11 +14,12 @@ import (
 // the referenced txid/id off the end of the key. This keeps index writes
 // to a single Set() per index and avoids a second lookup round-trip.
 const (
-	prefixTx     = "tx:"
-	prefixBump   = "bump:"
-	prefixStump  = "stump:"
-	prefixSub    = "sub:"
-	prefixLease  = "lease:"
+	prefixTx       = "tx:"
+	prefixBump     = "bump:"
+	prefixStump    = "stump:"
+	prefixSub      = "sub:"
+	prefixLease    = "lease:"
+	prefixDatahub  = "dh:"
 
 	prefixIdxTxStatus     = "idx:tx:status:"
 	prefixIdxTxBlock      = "idx:tx:block:"
@@ -33,6 +34,8 @@ func txKey(txid string) []byte            { return []byte(prefixTx + txid) }
 func bumpKey(blockHash string) []byte     { return []byte(prefixBump + blockHash) }
 func subKey(id string) []byte             { return []byte(prefixSub + id) }
 func leaseKey(name string) []byte         { return []byte(prefixLease + name) }
+func datahubEndpointKey(url string) []byte { return []byte(prefixDatahub + url) }
+func datahubEndpointPrefix() []byte        { return []byte(prefixDatahub) }
 
 func stumpKey(blockHash string, idx int) []byte {
 	return []byte(fmt.Sprintf("%s%s:%010d", prefixStump, blockHash, idx))

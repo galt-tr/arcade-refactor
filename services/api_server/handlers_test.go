@@ -110,6 +110,12 @@ func (m *mockStore) ClearRetryState(context.Context, string, models.Status, stri
 	return nil
 }
 func (m *mockStore) EnsureIndexes() error { return nil }
+func (m *mockStore) UpsertDatahubEndpoint(context.Context, store.DatahubEndpoint) error {
+	return nil
+}
+func (m *mockStore) ListDatahubEndpoints(context.Context) ([]store.DatahubEndpoint, error) {
+	return nil, nil
+}
 func (m *mockStore) Close() error         { return nil }
 
 func makeMinimalTx() []byte {

@@ -3,6 +3,7 @@ package p2p_client
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,8 +13,31 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/bsv-blockchain/arcade/config"
+	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
+
+// fakeEndpointWriter records every UpsertDatahubEndpoint call so tests can
+// assert that p2p_client persisted discovered URLs to the shared store.
+type fakeEndpointWriter struct {
+	mu    sync.Mutex
+	calls []store.DatahubEndpoint
+}
+
+func (f *fakeEndpointWriter) UpsertDatahubEndpoint(_ context.Context, ep store.DatahubEndpoint) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, ep)
+	return nil
+}
+
+func (f *fakeEndpointWriter) snapshot() []store.DatahubEndpoint {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]store.DatahubEndpoint, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
 
 // fakeTeraClient implements the teraClient interface so tests can push
 // hand-crafted NodeStatusMessage values without standing up a libp2p host.
@@ -47,17 +71,18 @@ func (f *fakeTeraClient) Close() error {
 	return nil
 }
 
-func newTestClient(t *testing.T, fc *fakeTeraClient, seedEndpoints []string) (*Client, *teranode.Client) {
+func newTestClient(t *testing.T, fc *fakeTeraClient, seedEndpoints []string) (*Client, *teranode.Client, *fakeEndpointWriter) {
 	t.Helper()
 	cfg := &config.Config{}
 	cfg.P2P.DatahubDiscovery = true
 	cfg.Network = config.NetworkMainnet
 
 	tc := teranode.NewClient(seedEndpoints, "", teranode.HealthConfig{})
+	w := &fakeEndpointWriter{}
 
-	c := New(cfg, zaptest.NewLogger(t), nil, tc)
+	c := New(cfg, zaptest.NewLogger(t), nil, tc, w)
 	c.clientFactory = func(_ context.Context, _ p2pclient.Config) (teraClient, error) { return fc, nil }
-	return c, tc
+	return c, tc, w
 }
 
 // runStart starts the client in a goroutine with a cancelable context and
@@ -136,7 +161,7 @@ func TestNetworkThreading_CanonicalToUpstream(t *testing.T) {
 			cfg.Network = tc.canonical
 
 			tcli := teranode.NewClient(nil, "", teranode.HealthConfig{})
-			c := New(cfg, zaptest.NewLogger(t), nil, tcli)
+			c := New(cfg, zaptest.NewLogger(t), nil, tcli, &fakeEndpointWriter{})
 			factory, cfgCh := captureLibraryConfig(fc)
 			c.clientFactory = factory
 
@@ -173,7 +198,7 @@ func TestNetworkThreading_OperatorBootstrapWins(t *testing.T) {
 	cfg.P2P.BootstrapPeers = []string{"/dnsaddr/custom.bootstrap"}
 
 	tcli := teranode.NewClient(nil, "", teranode.HealthConfig{})
-	c := New(cfg, zaptest.NewLogger(t), nil, tcli)
+	c := New(cfg, zaptest.NewLogger(t), nil, tcli, &fakeEndpointWriter{})
 	factory, cfgCh := captureLibraryConfig(fc)
 	c.clientFactory = factory
 
@@ -192,7 +217,7 @@ func TestNetworkThreading_OperatorBootstrapWins(t *testing.T) {
 
 func TestClient_NovelURLRegistered(t *testing.T) {
 	fc := newFakeTeraClient("sender")
-	c, tc := newTestClient(t, fc, []string{"https://static.example"})
+	c, tc, w := newTestClient(t, fc, []string{"https://static.example"})
 	_, stop := runStart(t, c)
 	defer stop()
 
@@ -211,11 +236,31 @@ func TestClient_NovelURLRegistered(t *testing.T) {
 	if !found {
 		t.Errorf("discovered URL not present: %v", eps)
 	}
+
+	// The discovery must also have been written to the shared store so that
+	// other pods (propagation, bump-builder running as separate K8s
+	// deployments) pick it up via teranode.Client's refresh loop. Poll
+	// briefly because the upsert happens after AddEndpoints.
+	deadline := time.Now().Add(time.Second)
+	var calls []store.DatahubEndpoint
+	for time.Now().Before(deadline) {
+		calls = w.snapshot()
+		if len(calls) >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(calls) != 1 || calls[0].URL != "https://peer.example" {
+		t.Errorf("expected one upsert for https://peer.example, got %+v", calls)
+	}
+	if calls[0].Source != store.DatahubEndpointSourceDiscovered {
+		t.Errorf("expected source=discovered, got %q", calls[0].Source)
+	}
 }
 
 func TestClient_RepeatedAnnouncementRegisteredOnce(t *testing.T) {
 	fc := newFakeTeraClient("sender")
-	c, tc := newTestClient(t, fc, []string{"https://static.example"})
+	c, tc, _ := newTestClient(t, fc, []string{"https://static.example"})
 	_, stop := runStart(t, c)
 	defer stop()
 
@@ -231,7 +276,7 @@ func TestClient_RepeatedAnnouncementRegisteredOnce(t *testing.T) {
 
 func TestClient_EmptyURLsIgnored(t *testing.T) {
 	fc := newFakeTeraClient("sender")
-	c, tc := newTestClient(t, fc, []string{"https://static.example"})
+	c, tc, _ := newTestClient(t, fc, []string{"https://static.example"})
 	_, stop := runStart(t, c)
 	defer stop()
 
@@ -249,7 +294,7 @@ func TestClient_EmptyURLsIgnored(t *testing.T) {
 
 func TestClient_InvalidURLRejected(t *testing.T) {
 	fc := newFakeTeraClient("sender")
-	c, tc := newTestClient(t, fc, []string{"https://static.example"})
+	c, tc, _ := newTestClient(t, fc, []string{"https://static.example"})
 	_, stop := runStart(t, c)
 	defer stop()
 
@@ -268,7 +313,7 @@ func TestClient_InvalidURLRejected(t *testing.T) {
 
 func TestClient_PropagationURLPreferred(t *testing.T) {
 	fc := newFakeTeraClient("sender")
-	c, tc := newTestClient(t, fc, nil)
+	c, tc, _ := newTestClient(t, fc, nil)
 	_, stop := runStart(t, c)
 	defer stop()
 
@@ -290,7 +335,7 @@ func TestClient_DisabledDiscoveryOpensNoBus(t *testing.T) {
 	tc := teranode.NewClient([]string{"https://static.example"}, "", teranode.HealthConfig{})
 
 	sentinel := false
-	c := New(cfg, zap.NewNop(), nil, tc)
+	c := New(cfg, zap.NewNop(), nil, tc, &fakeEndpointWriter{})
 	c.clientFactory = func(_ context.Context, _ p2pclient.Config) (teraClient, error) {
 		sentinel = true
 		return newFakeTeraClient("should-not-run"), nil

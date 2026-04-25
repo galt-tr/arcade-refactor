@@ -218,13 +218,19 @@ type PropagationConfig struct {
 // the recovery probe runs against the unhealthy set; ProbeTimeoutMs bounds each
 // probe request. MinHealthyEndpoints is an advisory warning threshold — when
 // the healthy count drops below it a single WARN is logged, but broadcasts are
-// never blocked by this value. Zero or negative values fall back to the
-// documented defaults at client construction time.
+// never blocked by this value.
+//
+// RefreshIntervalMs governs how often each pod's teranode.Client polls the
+// shared store for newly registered datahub URLs (the cross-pod discovery
+// path). Smaller values mean a fresh pod converges faster; larger values
+// reduce store load. Zero or negative values fall back to the documented
+// defaults at client construction time.
 type EndpointHealthConfig struct {
 	FailureThreshold    int `mapstructure:"failure_threshold"`
 	ProbeIntervalMs     int `mapstructure:"probe_interval_ms"`
 	ProbeTimeoutMs      int `mapstructure:"probe_timeout_ms"`
 	MinHealthyEndpoints int `mapstructure:"min_healthy_endpoints"`
+	RefreshIntervalMs   int `mapstructure:"refresh_interval_ms"`
 }
 
 // BumpBuilderConfig controls the BUMP construction workflow. GraceWindowMs is the
@@ -235,7 +241,7 @@ type BumpBuilderConfig struct {
 }
 
 func BindFlags(cmd *cobra.Command) {
-	cmd.Flags().String("mode", "all", "Service mode: all, api-server, bump-builder, tx-validator, propagation")
+	cmd.Flags().String("mode", "all", "Service mode: all, api-server, bump-builder, tx-validator, propagation, p2p-client")
 	cmd.Flags().String("config", "", "Path to config file")
 	cmd.Flags().String("log-level", "info", "Log level: debug, info, warn, error")
 	_ = viper.BindPFlag("mode", cmd.Flags().Lookup("mode"))
@@ -321,6 +327,7 @@ func setDefaults() {
 	viper.SetDefault("propagation.endpoint_health.probe_interval_ms", 30000)
 	viper.SetDefault("propagation.endpoint_health.probe_timeout_ms", 2000)
 	viper.SetDefault("propagation.endpoint_health.min_healthy_endpoints", 0)
+	viper.SetDefault("propagation.endpoint_health.refresh_interval_ms", 30000)
 
 	viper.SetDefault("network", NetworkMainnet)
 
@@ -377,6 +384,7 @@ func validate(cfg *Config) error {
 		"all": true, "api-server": true,
 		"bump-builder": true,
 		"tx-validator": true, "propagation": true,
+		"p2p-client": true,
 	}
 	if !validModes[cfg.Mode] {
 		return fmt.Errorf("invalid mode %q", cfg.Mode)

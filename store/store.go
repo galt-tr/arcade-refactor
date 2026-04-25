@@ -20,6 +20,22 @@ type PendingRetry struct {
 	NextRetryAt time.Time
 }
 
+// DatahubEndpointSourceConfigured marks endpoints seeded from static config.
+const DatahubEndpointSourceConfigured = "configured"
+
+// DatahubEndpointSourceDiscovered marks endpoints registered at runtime via
+// p2p discovery.
+const DatahubEndpointSourceDiscovered = "discovered"
+
+// DatahubEndpoint is a registered datahub URL persisted to the shared store
+// so propagation and bump-builder pods running as separate microservices
+// converge on the same union of (configured + p2p-discovered) URLs.
+type DatahubEndpoint struct {
+	URL      string
+	Source   string // DatahubEndpointSourceConfigured or DatahubEndpointSourceDiscovered
+	LastSeen time.Time
+}
+
 // Store handles all persistence operations for transactions and submissions
 type Store interface {
 	// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
@@ -97,6 +113,16 @@ type Store interface {
 
 	// EnsureIndexes creates any required secondary indexes for query operations.
 	EnsureIndexes() error
+
+	// UpsertDatahubEndpoint registers (or refreshes the LastSeen of) a datahub
+	// URL. Used by p2p_client to publish discovered URLs and by main to seed
+	// statically configured URLs so all pods see the same registry.
+	UpsertDatahubEndpoint(ctx context.Context, ep DatahubEndpoint) error
+
+	// ListDatahubEndpoints returns every registered datahub endpoint. Each
+	// pod's teranode.Client polls this on a refresh interval and merges new
+	// URLs into its in-memory list.
+	ListDatahubEndpoints(ctx context.Context) ([]DatahubEndpoint, error)
 
 	// Close closes the database connection
 	Close() error

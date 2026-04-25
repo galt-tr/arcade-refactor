@@ -316,3 +316,85 @@ func TestBumpRetryCount_UnknownTxID(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
+
+func TestDatahubEndpoints_UpsertAndList(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+
+	in := []store.DatahubEndpoint{
+		{URL: "https://a.example", Source: store.DatahubEndpointSourceConfigured, LastSeen: now},
+		{URL: "https://b.example", Source: store.DatahubEndpointSourceDiscovered, LastSeen: now.Add(time.Minute)},
+	}
+	for _, ep := range in {
+		if err := s.UpsertDatahubEndpoint(ctx, ep); err != nil {
+			t.Fatalf("upsert %s: %v", ep.URL, err)
+		}
+	}
+
+	out, err := s.ListDatahubEndpoints(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 endpoints, got %d: %+v", len(out), out)
+	}
+	got := map[string]store.DatahubEndpoint{}
+	for _, ep := range out {
+		got[ep.URL] = ep
+	}
+	for _, want := range in {
+		gotEp, ok := got[want.URL]
+		if !ok {
+			t.Fatalf("missing endpoint %s", want.URL)
+		}
+		if gotEp.Source != want.Source {
+			t.Errorf("%s source: got %q want %q", want.URL, gotEp.Source, want.Source)
+		}
+		if !gotEp.LastSeen.Equal(want.LastSeen) {
+			t.Errorf("%s last_seen: got %v want %v", want.URL, gotEp.LastSeen, want.LastSeen)
+		}
+	}
+}
+
+func TestDatahubEndpoints_UpsertOverwrites(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	t1 := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+	t2 := t1.Add(time.Hour)
+
+	if err := s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
+		URL: "https://a.example", Source: store.DatahubEndpointSourceConfigured, LastSeen: t1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
+		URL: "https://a.example", Source: store.DatahubEndpointSourceDiscovered, LastSeen: t2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := s.ListDatahubEndpoints(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 endpoint after upsert overwrite, got %d", len(out))
+	}
+	if out[0].Source != store.DatahubEndpointSourceDiscovered {
+		t.Errorf("source not overwritten: %q", out[0].Source)
+	}
+	if !out[0].LastSeen.Equal(t2) {
+		t.Errorf("last_seen not overwritten: got %v want %v", out[0].LastSeen, t2)
+	}
+}
+
+func TestDatahubEndpoints_RejectsEmptyURL(t *testing.T) {
+	s := newTestStore(t)
+	err := s.UpsertDatahubEndpoint(context.Background(), store.DatahubEndpoint{
+		URL: "", Source: store.DatahubEndpointSourceDiscovered, LastSeen: time.Now(),
+	})
+	if err == nil {
+		t.Fatal("expected error for empty URL")
+	}
+}

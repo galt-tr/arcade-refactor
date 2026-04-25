@@ -28,6 +28,7 @@ import (
 
 	"github.com/bsv-blockchain/arcade/config"
 	"github.com/bsv-blockchain/arcade/kafka"
+	"github.com/bsv-blockchain/arcade/store"
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
@@ -50,6 +51,14 @@ type teraClient interface {
 	Close() error
 }
 
+// EndpointWriter is the narrow store contract p2p_client needs: persist a
+// discovered datahub URL so other pods (propagation, bump-builder) can pick
+// it up via their teranode.Client refresh loop. Defined as an interface here
+// rather than taking *store.Store directly so tests can pass a fake.
+type EndpointWriter interface {
+	UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpoint) error
+}
+
 // clientFactory is overridable in tests to avoid starting a real libp2p host.
 type clientFactory func(ctx context.Context, cfg p2pclient.Config) (teraClient, error)
 
@@ -62,6 +71,7 @@ type Client struct {
 	logger        *zap.Logger
 	producer      *kafka.Producer
 	teranode      *teranode.Client
+	store         EndpointWriter
 	clientFactory clientFactory
 	bus           teraClient
 	done          chan struct{}
@@ -69,12 +79,13 @@ type Client struct {
 	stopOnce      sync.Once
 }
 
-func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, teranodeClient *teranode.Client) *Client {
+func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, teranodeClient *teranode.Client, st EndpointWriter) *Client {
 	return &Client{
 		cfg:           cfg,
 		logger:        logger.Named("p2p-client"),
 		producer:      producer,
 		teranode:      teranodeClient,
+		store:         st,
 		clientFactory: defaultClientFactory,
 		done:          make(chan struct{}),
 	}
@@ -219,6 +230,27 @@ func (c *Client) handleNodeStatus(msg teranodep2p.NodeStatusMessage) {
 		c.logger.Debug("endpoint count changed",
 			zap.Int("total_endpoints", len(eps)),
 		)
+	}
+
+	// Mirror to the shared store so other pods (propagation, bump-builder)
+	// pick up the URL on their next teranode.Client refresh tick. Idempotent:
+	// the upsert always advances LastSeen even when the URL was already known
+	// to the local in-memory client. Failure here is a soft warning — the
+	// local pod still works, only cross-pod visibility is delayed.
+	if c.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := c.store.UpsertDatahubEndpoint(ctx, store.DatahubEndpoint{
+			URL:      normalized,
+			Source:   store.DatahubEndpointSourceDiscovered,
+			LastSeen: time.Now(),
+		})
+		cancel()
+		if err != nil {
+			c.logger.Warn("failed to persist discovered datahub url",
+				zap.String("url", normalized),
+				zap.Error(err),
+			)
+		}
 	}
 }
 

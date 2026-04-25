@@ -107,3 +107,9 @@ bump_builder:
 #     probe_interval_ms: 30000
 #     probe_timeout_ms: 2000
 #     min_healthy_endpoints: 0
+#     # Cross-pod URL discovery: the p2p-client pod writes discovered datahub
+#     # URLs to the shared store; every other pod's teranode.Client polls the
+#     # store on this interval to merge them in. Standalone single-process
+#     # mode also runs the loop, but the in-process AddEndpoints fast path
+#     # makes it largely a no-op deduper.
+#     refresh_interval_ms: 30000

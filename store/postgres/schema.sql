@@ -60,3 +60,10 @@ CREATE TABLE IF NOT EXISTS leases (
     holder     TEXT NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS datahub_endpoints (
+    url        TEXT PRIMARY KEY,
+    source     TEXT NOT NULL,
+    last_seen  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dh_last_seen ON datahub_endpoints(last_seen);

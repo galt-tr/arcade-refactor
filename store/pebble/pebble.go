@@ -161,6 +161,12 @@ type storedBump struct {
 	BumpData    []byte `json:"bump_data"`
 }
 
+type storedDatahubEndpoint struct {
+	URL              string `json:"url"`
+	Source           string `json:"source"`
+	LastSeenUnixNs   int64  `json:"last_seen"`
+}
+
 // New opens a Pebble database at cfg.Path and returns a Store ready to use.
 // If the directory does not exist it's created. The returned Store takes an
 // exclusive file lock on the directory — closing the Store releases it.
@@ -1064,6 +1070,64 @@ func (s *Store) Release(ctx context.Context, name, holder string) error {
 		closer.Close()
 	}
 	return s.db.Delete(leaseKey(name), s.writeOpts)
+}
+
+// --- Datahub endpoint registry ---
+
+func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpoint) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ep.URL == "" {
+		return fmt.Errorf("upsert datahub endpoint: empty url")
+	}
+	stored := storedDatahubEndpoint{
+		URL:    ep.URL,
+		Source: ep.Source,
+	}
+	if !ep.LastSeen.IsZero() {
+		stored.LastSeenUnixNs = ep.LastSeen.UnixNano()
+	}
+	payload, err := json.Marshal(stored)
+	if err != nil {
+		return err
+	}
+	return s.db.Set(datahubEndpointKey(ep.URL), payload, s.writeOpts)
+}
+
+func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoint, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prefix := datahubEndpointPrefix()
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: endOfPrefix(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var out []store.DatahubEndpoint
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		var row storedDatahubEndpoint
+		if err := json.Unmarshal(iter.Value(), &row); err != nil {
+			continue
+		}
+		ep := store.DatahubEndpoint{
+			URL:    row.URL,
+			Source: row.Source,
+		}
+		if row.LastSeenUnixNs != 0 {
+			ep.LastSeen = time.Unix(0, row.LastSeenUnixNs)
+		}
+		out = append(out, ep)
+	}
+	return out, nil
 }
 
 // --- Helpers ---

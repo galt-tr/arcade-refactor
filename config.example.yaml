@@ -86,6 +86,12 @@ health:
 #     probe_interval_ms: 30000
 #     probe_timeout_ms: 2000
 #     min_healthy_endpoints: 0
+#     # How often each pod's teranode.Client polls the shared store for new
+#     # datahub URLs registered by the p2p-client pod. Lower = faster cross-pod
+#     # convergence; higher = less store load. The first refresh runs
+#     # synchronously on Start (capped at 2s) so a freshly started pod sees
+#     # the current registry before serving traffic.
+#     refresh_interval_ms: 30000
 
 bump_builder:
   # Grace window after BLOCK_PROCESSED before reading STUMPs, to allow for

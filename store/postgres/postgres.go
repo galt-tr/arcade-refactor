@@ -571,6 +571,45 @@ func (s *Store) Release(ctx context.Context, name, holder string) error {
 	return nil
 }
 
+// --- Datahub endpoint registry ---
+
+func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpoint) error {
+	if ep.URL == "" {
+		return fmt.Errorf("upsert datahub endpoint: empty url")
+	}
+	const q = `
+INSERT INTO datahub_endpoints (url, source, last_seen)
+VALUES ($1, $2, $3)
+ON CONFLICT (url) DO UPDATE SET
+    source = EXCLUDED.source,
+    last_seen = EXCLUDED.last_seen`
+	if _, err := s.pool.Exec(ctx, q, ep.URL, ep.Source, ep.LastSeen); err != nil {
+		return fmt.Errorf("upsert datahub endpoint %s: %w", ep.URL, err)
+	}
+	return nil
+}
+
+func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoint, error) {
+	const q = `SELECT url, source, last_seen FROM datahub_endpoints`
+	rows, err := s.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("list datahub endpoints: %w", err)
+	}
+	defer rows.Close()
+	var out []store.DatahubEndpoint
+	for rows.Next() {
+		var ep store.DatahubEndpoint
+		if err := rows.Scan(&ep.URL, &ep.Source, &ep.LastSeen); err != nil {
+			return nil, fmt.Errorf("scan datahub endpoint: %w", err)
+		}
+		out = append(out, ep)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iter datahub endpoints: %w", err)
+	}
+	return out, nil
+}
+
 // --- scan helpers ---
 
 type rowScanner interface {

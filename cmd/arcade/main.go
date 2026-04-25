@@ -93,9 +93,33 @@ func run(cmd *cobra.Command, _ []string) error {
 		ProbeInterval:       time.Duration(cfg.Propagation.EndpointHealth.ProbeIntervalMs) * time.Millisecond,
 		ProbeTimeout:        time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
 		MinHealthyEndpoints: cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
+		RefreshInterval:     time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
+		Source:              endpointSource{st: st},
 		Logger:              logger,
 	})
 	defer teranodeClient.Close()
+
+	// Seed the registry with statically configured URLs so a freshly started
+	// pod (especially mode=p2p-client which has no static list of its own to
+	// broadcast against) always sees them via the same discovery path. The
+	// upsert is idempotent and refreshes LastSeen on every restart, so this
+	// also works as a heartbeat for the operator-defined seed list.
+	if len(cfg.DatahubURLs) > 0 {
+		seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		for _, url := range cfg.DatahubURLs {
+			if err := st.UpsertDatahubEndpoint(seedCtx, store.DatahubEndpoint{
+				URL:      url,
+				Source:   store.DatahubEndpointSourceConfigured,
+				LastSeen: time.Now(),
+			}); err != nil {
+				logger.Warn("failed to seed configured datahub url",
+					zap.String("url", url),
+					zap.Error(err),
+				)
+			}
+		}
+		seedCancel()
+	}
 
 	var merkleClient *merkleservice.Client
 	if cfg.MerkleService.URL != "" {
@@ -181,17 +205,42 @@ func buildServices(
 		svcs = append(svcs, api_server.New(cfg, logger, producer, st, txTracker, teranodeClient))
 	}
 	if shouldRun("bump-builder") {
-		svcs = append(svcs, bump_builder.New(cfg, logger, producer, st))
+		svcs = append(svcs, bump_builder.New(cfg, logger, producer, st, teranodeClient))
 	}
 	if shouldRun("tx-validator") {
 		svcs = append(svcs, tx_validator.New(cfg, logger, producer, st, txTracker, txVal))
 	}
 	if shouldRun("propagation") {
 		svcs = append(svcs, propagation.New(cfg, logger, producer, st, leaser, teranodeClient, merkleClient))
-		svcs = append(svcs, p2p_client.New(cfg, logger, producer, teranodeClient))
+	}
+	// p2p_client is its own service; it's needed both by mode=propagation
+	// (where it feeds the local teranode.Client directly) and by mode=p2p-client
+	// (its own pod in the K8s topology, where it publishes discoveries to the
+	// shared store for other pods to pick up via refresh).
+	if shouldRun("propagation") || shouldRun("p2p-client") {
+		svcs = append(svcs, p2p_client.New(cfg, logger, producer, teranodeClient, st))
 	}
 
 	return svcs
+}
+
+// endpointSource adapts store.Store to teranode.EndpointSource by extracting
+// just the URL list. Defining the adapter here (rather than in teranode) keeps
+// the teranode package free of a direct store dependency.
+type endpointSource struct {
+	st store.Store
+}
+
+func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
+	eps, err := a.st.ListDatahubEndpoints(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(eps))
+	for _, ep := range eps {
+		out = append(out, ep.URL)
+	}
+	return out, nil
 }
 
 func newLogger(level string) *zap.Logger {

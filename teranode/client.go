@@ -66,13 +66,31 @@ type EndpointStatus struct {
 // fall back to documented defaults inside NewClient. A nil Logger is replaced
 // with zap.NewNop() so callers don't have to plumb a logger when they don't
 // care about transition logs.
+//
+// Source + RefreshInterval enable distributed endpoint discovery: when Source
+// is non-nil the client polls it on RefreshInterval and merges the URLs into
+// the in-memory list via AddEndpoints. This is how a bump-builder pod sees
+// URLs that the p2p-client pod discovered. Leave Source nil in monolith mode
+// or in tests that don't care about discovery.
 type HealthConfig struct {
 	FailureThreshold    int
 	ProbeInterval       time.Duration
 	ProbeTimeout        time.Duration
 	MinHealthyEndpoints int
+	RefreshInterval     time.Duration
+	Source              EndpointSource
 	Logger              *zap.Logger
 }
+
+// EndpointSource produces a set of datahub URLs. The expected implementation
+// is a thin adapter over the shared store; the interface keeps teranode free
+// of a direct store dependency.
+type EndpointSource interface {
+	ListEndpointURLs(ctx context.Context) ([]string, error)
+}
+
+const defaultRefreshInterval = 30 * time.Second
+const refreshStartupTimeout = 2 * time.Second
 
 // Client handles communication with teranode endpoints. The endpoint list is
 // mutable at runtime (see AddEndpoints) so peer-discovery services can merge
@@ -94,12 +112,15 @@ type Client struct {
 	probeInterval       time.Duration
 	probeTimeout        time.Duration
 	minHealthyEndpoints int
+	refreshInterval     time.Duration
+	source              EndpointSource
 	logger              *zap.Logger
 	belowThreshold      bool
 
 	startOnce   sync.Once
 	probeCancel context.CancelFunc
 	probeDone   chan struct{}
+	refreshDone chan struct{}
 }
 
 // normalizeURL trims a single trailing slash. Two peers announcing the same
@@ -126,6 +147,9 @@ func NewClient(endpoints []string, authToken string, hc HealthConfig) *Client {
 	if hc.MinHealthyEndpoints < 0 {
 		hc.MinHealthyEndpoints = 0
 	}
+	if hc.RefreshInterval <= 0 {
+		hc.RefreshInterval = defaultRefreshInterval
+	}
 	if hc.Logger == nil {
 		hc.Logger = zap.NewNop()
 	}
@@ -141,6 +165,8 @@ func NewClient(endpoints []string, authToken string, hc HealthConfig) *Client {
 		probeInterval:       hc.ProbeInterval,
 		probeTimeout:        hc.ProbeTimeout,
 		minHealthyEndpoints: hc.MinHealthyEndpoints,
+		refreshInterval:     hc.RefreshInterval,
+		source:              hc.Source,
 		logger:              hc.Logger.Named("teranode-client"),
 	}
 	for _, ep := range endpoints {
@@ -158,21 +184,35 @@ func NewClient(endpoints []string, authToken string, hc HealthConfig) *Client {
 	return c
 }
 
-// Start launches the background probe goroutine. It is idempotent — calling
-// Start more than once is a no-op after the first call. The probe goroutine
-// runs until either the provided context is cancelled or Close is called,
-// whichever happens first.
+// Start launches the background probe goroutine and (when an EndpointSource
+// is configured) the endpoint refresh goroutine. It is idempotent — calling
+// Start more than once is a no-op after the first call. Both goroutines run
+// until either the provided context is cancelled or Close is called.
+//
+// When an EndpointSource is configured, Start blocks briefly on a synchronous
+// first refresh so a freshly started pod converges to the current registry
+// before serving traffic. The wait is capped at refreshStartupTimeout so a
+// slow store doesn't gate pod readiness.
 func (c *Client) Start(ctx context.Context) {
 	c.startOnce.Do(func() {
+		if c.source != nil {
+			c.refreshOnceWithTimeout(ctx, refreshStartupTimeout)
+		}
+
 		probeCtx, cancel := context.WithCancel(ctx)
 		c.probeCancel = cancel
 		c.probeDone = make(chan struct{})
 		go c.probeLoop(probeCtx)
+
+		if c.source != nil {
+			c.refreshDone = make(chan struct{})
+			go c.refreshLoop(probeCtx)
+		}
 	})
 }
 
-// Close stops the probe goroutine and waits for it to exit. Safe to call even
-// if Start was never invoked.
+// Close stops the background goroutines and waits for them to exit. Safe to
+// call even if Start was never invoked.
 func (c *Client) Close() {
 	if c.probeCancel != nil {
 		c.probeCancel()
@@ -180,6 +220,52 @@ func (c *Client) Close() {
 	if c.probeDone != nil {
 		<-c.probeDone
 	}
+	if c.refreshDone != nil {
+		<-c.refreshDone
+	}
+}
+
+// refreshLoop polls the EndpointSource on the configured interval and merges
+// new URLs via AddEndpoints. The merge is idempotent (AddEndpoints dedupes by
+// the seen map) so the loop is safe to run alongside p2p_client's direct
+// AddEndpoints calls in monolith mode.
+func (c *Client) refreshLoop(ctx context.Context) {
+	defer close(c.refreshDone)
+	ticker := time.NewTicker(c.refreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.refreshOnce(ctx)
+		}
+	}
+}
+
+// refreshOnce queries the source for the current URL set and merges any new
+// entries. Errors are logged at warn — a transient store glitch does not
+// disrupt the in-memory list, which the circuit-breaker can still curate.
+func (c *Client) refreshOnce(ctx context.Context) {
+	urls, err := c.source.ListEndpointURLs(ctx)
+	if err != nil {
+		c.logger.Warn("endpoint refresh failed", zap.Error(err))
+		return
+	}
+	if added := c.AddEndpoints(urls); added > 0 {
+		c.logger.Info("endpoint refresh added urls",
+			zap.Int("added", added),
+			zap.Int("total", len(c.GetEndpoints())),
+		)
+	}
+}
+
+// refreshOnceWithTimeout runs the synchronous first refresh under a bounded
+// timeout so Start cannot block indefinitely on a slow store.
+func (c *Client) refreshOnceWithTimeout(ctx context.Context, d time.Duration) {
+	cctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	c.refreshOnce(cctx)
 }
 
 // AddEndpoints merges the given URLs into the runtime endpoint list,

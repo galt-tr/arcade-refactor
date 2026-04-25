@@ -11,6 +11,9 @@
 mode: all
 log_level: debug
 
+callback_url: "https://rearden-steel.ngrok.app/api/v1/merkle-service/callback"
+
+
 # Bitcoin network: mainnet | testnet | teratestnet. Drives both the p2p
 # discovery topic and the embedded chaintracks bootstrap peers.
 network: teratestnet

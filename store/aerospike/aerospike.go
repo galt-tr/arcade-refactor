@@ -25,12 +25,13 @@ func isKeyNotFound(err error) bool {
 }
 
 const (
-	setTransactions   = "transactions"
-	setBumps          = "bumps"
-	setStumps         = "stumps"
-	setSubmissions    = "submissions"
+	setTransactions    = "transactions"
+	setBumps           = "bumps"
+	setStumps          = "stumps"
+	setSubmissions     = "submissions"
 	setProcessedBlocks = "processed_blocks"
-	setLeases         = "leases"
+	setLeases          = "leases"
+	setDatahubEndpoints = "datahub_endpoints"
 )
 
 // Ensure Store implements the store interfaces.
@@ -109,6 +110,7 @@ func (s *Store) EnsureIndexes() error {
 		{setSubmissions, "callback_token", "idx_sub_callback_token", aero.STRING},
 		{setProcessedBlocks, "block_height", "idx_pb_block_height", aero.NUMERIC},
 		{setTransactions, "status", "idx_tx_status", aero.STRING},
+		{setDatahubEndpoints, "last_seen", "idx_dh_last_seen", aero.NUMERIC},
 	}
 	// CreateIndex returns an IndexTask that must be polled — the server call
 	// is asynchronous and the index won't be queryable on every node until
@@ -940,6 +942,78 @@ func (s *Store) MarkBlockOffChain(ctx context.Context, blockHash string) error {
 		return err
 	}
 	return s.client.Put(s.writePolicy(ctx), key, aero.BinMap{"on_chain": 0})
+}
+
+// --- Datahub endpoint registry ---
+
+// UpsertDatahubEndpoint writes the endpoint with the URL as primary key.
+// Existing rows are overwritten so LastSeen advances and a flap from
+// "discovered" to "configured" (or vice versa) is reflected.
+func (s *Store) UpsertDatahubEndpoint(ctx context.Context, ep store.DatahubEndpoint) error {
+	if ep.URL == "" {
+		return fmt.Errorf("upsert datahub endpoint: empty url")
+	}
+	key, err := s.key(setDatahubEndpoints, ep.URL)
+	if err != nil {
+		return err
+	}
+	bins := aero.BinMap{
+		"url":       ep.URL,
+		"source":    ep.Source,
+		"last_seen": ep.LastSeen.UnixMilli(),
+	}
+	return s.client.Put(s.writePolicy(ctx), key, bins)
+}
+
+// ListDatahubEndpoints scans every row in the registry. Cardinality is
+// expected in the dozens to low hundreds — no pagination needed.
+func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoint, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stmt := aero.NewStatement(s.namespace, setDatahubEndpoints)
+	rs, err := s.client.Query(s.queryPolicy(ctx), stmt)
+	if rs != nil {
+		defer rs.Close()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query datahub endpoints: %w", err)
+	}
+
+	var (
+		out     []store.DatahubEndpoint
+		loopErr error
+	)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
+		case rec, ok := <-rs.Results():
+			if !ok {
+				break loop
+			}
+			if rec.Err != nil {
+				loopErr = rec.Err
+				break loop
+			}
+			ep := store.DatahubEndpoint{
+				URL:    getString(rec.Record, "url"),
+				Source: getString(rec.Record, "source"),
+			}
+			if ms := getInt64(rec.Record, "last_seen"); ms > 0 {
+				ep.LastSeen = time.UnixMilli(ms)
+			}
+			if ep.URL != "" {
+				out = append(out, ep)
+			}
+		}
+	}
+	if loopErr != nil {
+		return nil, loopErr
+	}
+	return out, nil
 }
 
 // --- Helpers ---
