@@ -115,8 +115,13 @@ func (s *Server) initChaintracks(ctx context.Context) error {
 	// still bootstrap its block headers from mainnet. Bootstrap peers are
 	// injected from the same resolver the discovery service uses, so chaintracks
 	// and the datahub client always agree on which network they joined.
-	topicNetwork, defaultBootstrap := config.ResolveP2PNetwork(s.cfg.Network)
-	s.cfg.Chaintracks.P2P.Network = topicNetwork
+	//
+	// Chaintracks needs the upstream-strict spelling ("main"/"test"/"teratestnet")
+	// because its chainmanager.getGenesisHeader switch is exact-match; the
+	// p2p-client tolerates either form via its own alias map, so the discovery
+	// service still gets the canonical "mainnet"/"testnet"/"teratestnet" topic.
+	_, defaultBootstrap := config.ResolveP2PNetwork(s.cfg.Network)
+	s.cfg.Chaintracks.P2P.Network = config.ResolveChaintracksNetwork(s.cfg.Network)
 	if len(s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers) == 0 {
 		s.cfg.Chaintracks.P2P.MsgBus.BootstrapPeers = defaultBootstrap
 	}

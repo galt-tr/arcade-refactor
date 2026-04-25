@@ -50,6 +50,23 @@ func ResolveP2PNetwork(network string) (topicNetwork string, bootstrapPeers []st
 	}
 }
 
+// ResolveChaintracksNetwork maps a canonical arcade network name to the value
+// go-chaintracks accepts at config.P2P.Network. Its chainmanager.getGenesisHeader
+// only knows "main"/"test"/"teratest"/"teratestnet", so we translate at the
+// boundary instead of leaking upstream naming into the arcade config surface.
+func ResolveChaintracksNetwork(network string) string {
+	switch network {
+	case NetworkTestnet:
+		return "test"
+	case NetworkTeratestnet:
+		return NetworkTeratestnet
+	case NetworkMainnet, "":
+		fallthrough
+	default:
+		return "main"
+	}
+}
+
 type Config struct {
 	Mode          string              `mapstructure:"mode"`
 	LogLevel      string              `mapstructure:"log_level"`

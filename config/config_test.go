@@ -75,3 +75,27 @@ func TestResolveP2PNetwork(t *testing.T) {
 		})
 	}
 }
+
+// ResolveChaintracksNetwork translates to go-chaintracks's stricter accepted
+// set. Regressing this is the bug that crashed prod with "unknown network:
+// mainnet" — chainmanager.getGenesisHeader is an exact-match switch over
+// "main"/"test"/"teratest"/"teratestnet".
+func TestResolveChaintracksNetwork(t *testing.T) {
+	cases := []struct {
+		network string
+		want    string
+	}{
+		{NetworkMainnet, "main"},
+		{NetworkTestnet, "test"},
+		{NetworkTeratestnet, NetworkTeratestnet},
+		{"", "main"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.network, func(t *testing.T) {
+			got := ResolveChaintracksNetwork(tc.network)
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
