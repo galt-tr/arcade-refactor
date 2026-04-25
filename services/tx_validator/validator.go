@@ -453,7 +453,7 @@ func (v *Validator) phaseValidate(ctx context.Context, live []*validatedTx) {
 				)
 				return nil
 			}
-			v.txTracker.Add(vt.txid, vt.existing.Status)
+			v.txTracker.Add(vt.txid, models.StatusReceived)
 			return nil
 		})
 	}
