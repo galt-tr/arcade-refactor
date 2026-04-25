@@ -48,6 +48,12 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 func (m *mockStore) GetOrInsertStatus(context.Context, *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
 	return nil, false, nil
 }
+func (m *mockStore) BatchGetOrInsertStatus(context.Context, []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	return nil, nil
+}
+func (m *mockStore) BatchUpdateStatus(context.Context, []*models.TransactionStatus) error {
+	return nil
+}
 func (m *mockStore) GetStatus(context.Context, string) (*models.TransactionStatus, error) {
 	return nil, nil
 }

@@ -312,6 +312,18 @@ func (s *Store) removeStatusIndexes(b *pebbledb.Batch, st storedStatus) {
 
 // UpdateStatus replaces the status row for status.TxID. It's a full rewrite:
 // any existing secondary index entries for the previous version are deleted
+// BatchGetOrInsertStatus runs GetOrInsertStatus concurrently for each row.
+// Pebble is single-process and operations are already memory-fast; the
+// parallel-loop fallback is the simplest correct path here.
+func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	return store.BatchGetOrInsertStatusParallel(ctx, s, statuses)
+}
+
+// BatchUpdateStatus runs UpdateStatus concurrently for each row.
+func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error {
+	return store.BatchUpdateStatusParallel(ctx, s, statuses)
+}
+
 // and the new set is written in the same batch, so an intermediate query
 // never sees a stale index pointing at a row with a different status.
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {

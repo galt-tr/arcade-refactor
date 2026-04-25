@@ -24,24 +24,28 @@ import (
 	"github.com/bsv-blockchain/arcade/store"
 )
 
+// newEmbeddedCfg builds a Postgres config that points at either an external
+// DSN (when ARCADE_POSTGRES_DSN is set) or a fresh embedded-postgres data
+// directory under tempDir. Shared by newTestStore (testing.T) and the
+// *testing.B helper used by benchmarks.
+func newEmbeddedCfg(tempDir string) config.Postgres {
+	if dsn := os.Getenv("ARCADE_POSTGRES_DSN"); dsn != "" {
+		return config.Postgres{DSN: dsn, MaxConns: 4}
+	}
+	return config.Postgres{
+		Embedded:         true,
+		EmbeddedUser:     "arcade",
+		EmbeddedPassword: "arcade",
+		EmbeddedDatabase: "arcade",
+		EmbeddedDataDir:  tempDir + "/data",
+		EmbeddedCacheDir: tempDir + "/cache",
+		MaxConns:         4,
+	}
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-
-	var cfg config.Postgres
-	if dsn := os.Getenv("ARCADE_POSTGRES_DSN"); dsn != "" {
-		cfg = config.Postgres{DSN: dsn, MaxConns: 4}
-	} else {
-		dir := t.TempDir()
-		cfg = config.Postgres{
-			Embedded:         true,
-			EmbeddedUser:     "arcade",
-			EmbeddedPassword: "arcade",
-			EmbeddedDatabase: "arcade",
-			EmbeddedDataDir:  dir + "/data",
-			EmbeddedCacheDir: dir + "/cache",
-			MaxConns:         4,
-		}
-	}
+	cfg := newEmbeddedCfg(t.TempDir())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

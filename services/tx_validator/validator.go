@@ -343,73 +343,89 @@ func parseOne(rawTx []byte) (res parseResult) {
 	return res
 }
 
-// phaseDedup runs GetOrInsertStatus concurrently for each successfully parsed
-// tx. Returns the slice of "new" txs that need validation, and a count of
-// duplicates (already-known txids) that are short-circuited via the tx tracker
-// without going further down the pipeline.
+// phaseDedup uses the store's batch CAS to insert (or read existing rows
+// for) the parsed tx set in one round-trip on backends that support it
+// (Postgres) and a bounded-concurrency loop on the others. Returns the
+// slice of "new" txs that need validation and the duplicates that
+// short-circuit the pipeline via the tx tracker.
 //
-// Errors here are logged and the offending tx is dropped — a transient store
-// failure means we don't propagate the tx but we don't write a reject either,
-// so the client can retry.
+// Errors here are logged and the offending batch is dropped — a transient
+// store failure means we don't propagate but don't write a reject either,
+// so clients can retry.
 func (v *Validator) phaseDedup(ctx context.Context, parsed []parseResult) (live []*validatedTx, duplicates []*validatedTx) {
 	live = make([]*validatedTx, 0, len(parsed))
 	duplicates = make([]*validatedTx, 0, len(parsed))
 
-	// Per-position output; merge into live/duplicates after the parallel section.
-	type slot struct {
-		vt   *validatedTx
-		dup  bool
-		drop bool
-	}
-	slots := make([]slot, len(parsed))
-
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(v.parallelism)
+	// Build the input slice for the batch CAS, keeping a parallel slice of
+	// per-position validatedTx records so we can stitch the results back into
+	// input order after the call returns. Parse failures don't go to the
+	// store (no txid).
+	insertInputs := make([]*models.TransactionStatus, 0, len(parsed))
+	insertSlots := make([]int, 0, len(parsed))
+	vts := make([]*validatedTx, len(parsed))
+	now := time.Now()
 	for i, p := range parsed {
-		i, p := i, p
 		if p.err != nil || p.parsed == nil {
-			// Parse failure — no txid to dedup against; drop quietly. Log was
-			// already part of the parse path.
 			v.logger.Debug("dropping unparseable tx", zap.Error(p.err))
-			slots[i] = slot{drop: true}
 			continue
 		}
-		g.Go(func() error {
-			existing, inserted, err := v.store.GetOrInsertStatus(gctx, &models.TransactionStatus{
-				TxID:      p.txid,
-				Timestamp: time.Now(),
-			})
-			if err != nil {
-				v.logger.Error("dedup store error", zap.String("txid", p.txid), zap.Error(err))
-				metrics.TxValidatorOutcomeTotal.WithLabelValues("store_error").Inc()
-				slots[i] = slot{drop: true}
-				return nil // Don't fail the whole batch on a store hiccup.
-			}
-			vt := &validatedTx{
-				rawTx:    p.rawTx,
-				parsed:   p.parsed,
-				txid:     p.txid,
-				existing: existing,
-				inserted: inserted,
-			}
-			if !inserted {
-				v.txTracker.Add(p.txid, existing.Status)
-			}
-			slots[i] = slot{vt: vt, dup: !inserted}
-			return nil
+		insertInputs = append(insertInputs, &models.TransactionStatus{
+			TxID:      p.txid,
+			Timestamp: now,
 		})
+		insertSlots = append(insertSlots, i)
+		vts[i] = &validatedTx{
+			rawTx:  p.rawTx,
+			parsed: p.parsed,
+			txid:   p.txid,
+		}
 	}
-	_ = g.Wait()
 
-	for _, s := range slots {
-		if s.drop || s.vt == nil {
+	if len(insertInputs) == 0 {
+		return live, duplicates
+	}
+
+	results, err := v.store.BatchGetOrInsertStatus(ctx, insertInputs)
+	if err != nil {
+		v.logger.Error("dedup store error", zap.Int("count", len(insertInputs)), zap.Error(err))
+		// Per-row failures are reflected as zero-value entries in `results` —
+		// process whatever came back so a single bad row doesn't kill the
+		// whole batch on parallel-loop backends. True batched-SQL backends
+		// fail atomically: results is nil/empty, so nothing graduates.
+	}
+	storeErrors := 0
+	for k, slotIdx := range insertSlots {
+		vt := vts[slotIdx]
+		var res store.BatchInsertResult
+		if k < len(results) {
+			res = results[k]
+		}
+		// A zero-value result means: not inserted AND no existing row, i.e.
+		// the per-row store call failed. Drop these and count as store_error.
+		if !res.Inserted && res.Existing == nil {
+			storeErrors++
+			vts[slotIdx] = nil
 			continue
 		}
-		if s.dup {
-			duplicates = append(duplicates, s.vt)
+		vt.inserted = res.Inserted
+		vt.existing = res.Existing
+		if !res.Inserted {
+			v.txTracker.Add(vt.txid, res.Existing.Status)
+		}
+	}
+	if storeErrors > 0 {
+		metrics.TxValidatorOutcomeTotal.WithLabelValues("store_error").Add(float64(storeErrors))
+	}
+
+	for _, vt := range vts {
+		if vt == nil {
 			continue
 		}
-		live = append(live, s.vt)
+		if vt.inserted {
+			live = append(live, vt)
+		} else {
+			duplicates = append(duplicates, vt)
+		}
 	}
 	return live, duplicates
 }
@@ -445,35 +461,29 @@ func (v *Validator) phaseValidate(ctx context.Context, live []*validatedTx) {
 }
 
 // phasePersistRejects writes REJECTED status + reject reason for every tx
-// that failed validation. Validation rejects are terminal — there is no
-// retry path — so a store error here just gets logged. The txid was already
-// inserted in phase 2, so the row exists.
+// that failed validation via the store's batch update — single round-trip
+// on Postgres, parallel-loop fallback on Aerospike/Pebble. The txid was
+// already inserted in phase 2 so the rows exist.
 func (v *Validator) phasePersistRejects(ctx context.Context, rejects []*validatedTx) {
 	if len(rejects) == 0 {
 		return
 	}
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(v.parallelism)
 	now := time.Now()
-	for _, vt := range rejects {
-		vt := vt
-		g.Go(func() error {
-			err := v.store.UpdateStatus(gctx, &models.TransactionStatus{
-				TxID:      vt.txid,
-				Status:    models.StatusRejected,
-				ExtraInfo: vt.rejectReason,
-				Timestamp: now,
-			})
-			if err != nil {
-				v.logger.Error("failed to persist rejected status",
-					zap.String("txid", vt.txid),
-					zap.Error(err),
-				)
-			}
-			return nil
-		})
+	updates := make([]*models.TransactionStatus, len(rejects))
+	for i, vt := range rejects {
+		updates[i] = &models.TransactionStatus{
+			TxID:      vt.txid,
+			Status:    models.StatusRejected,
+			ExtraInfo: vt.rejectReason,
+			Timestamp: now,
+		}
 	}
-	_ = g.Wait()
+	if err := v.store.BatchUpdateStatus(ctx, updates); err != nil {
+		v.logger.Error("failed to persist rejected statuses",
+			zap.Int("count", len(rejects)),
+			zap.Error(err),
+		)
+	}
 }
 
 func collectAccepted(live []*validatedTx) []*validatedTx {

@@ -262,6 +262,20 @@ func (s *Store) GetOrInsertStatus(ctx context.Context, status *models.Transactio
 	return status, true, nil
 }
 
+// BatchGetOrInsertStatus runs GetOrInsertStatus concurrently for each row.
+// Aerospike's BatchOperate API doesn't support per-record CREATE_ONLY with
+// the existing-row read-back semantics this method needs, so the parallel-
+// loop fallback is the simplest correct path. Each Aerospike op is already
+// fast (~1-3ms) so 16-way parallelism easily saturates throughput.
+func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	return store.BatchGetOrInsertStatusParallel(ctx, s, statuses)
+}
+
+// BatchUpdateStatus runs UpdateStatus concurrently for each row.
+func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error {
+	return store.BatchUpdateStatusParallel(ctx, s, statuses)
+}
+
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
 	key, err := s.key(setTransactions, status.TxID)
 	if err != nil {

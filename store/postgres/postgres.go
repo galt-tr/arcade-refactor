@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -160,6 +161,180 @@ ON CONFLICT (txid) DO NOTHING`
 		return nil, false, err
 	}
 	return existing, false, nil
+}
+
+// columnsPerInsertRow is how many placeholders one row in the multi-row
+// INSERT VALUES list consumes. Matches the column list in the static SQL
+// fragment built by BatchGetOrInsertStatus.
+const columnsPerInsertRow = 13
+
+// BatchGetOrInsertStatus is the multi-row form of GetOrInsertStatus. It uses
+// the "xmax = 0" trick: ON CONFLICT DO UPDATE SET txid = excluded.txid is a
+// no-op write that nonetheless triggers RETURNING for the existing row, and
+// xmax is 0 for newly-inserted rows but non-zero for rows we re-touched. So
+// one round-trip gives us per-row inserted/existing flag plus the existing
+// row data when the insert lost the race.
+//
+// The single-row GetOrInsertStatus uses ON CONFLICT DO NOTHING + a fallback
+// SELECT, which is two round-trips when the row exists. For batches of 100+
+// txs the win from collapsing into one round-trip is large.
+func (s *Store) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+
+	// Normalise inputs the same way GetOrInsertStatus does — empty Status
+	// becomes RECEIVED, missing timestamps default to now, CreatedAt is set.
+	now := time.Now()
+	args := make([]any, 0, len(statuses)*columnsPerInsertRow)
+	for _, st := range statuses {
+		if st.Timestamp.IsZero() {
+			st.Timestamp = now
+		}
+		if st.Status == "" {
+			st.Status = models.StatusReceived
+		}
+		st.CreatedAt = now
+
+		var competing any
+		if len(st.CompetingTxs) > 0 {
+			b, err := json.Marshal(st.CompetingTxs)
+			if err != nil {
+				return nil, fmt.Errorf("marshal competing_txs for %s: %w", st.TxID, err)
+			}
+			competing = string(b)
+		}
+		var nextRetry any
+		if !st.NextRetryAt.IsZero() {
+			nextRetry = st.NextRetryAt
+		}
+		args = append(args,
+			st.TxID, string(st.Status), st.StatusCode,
+			st.BlockHash, int64(st.BlockHeight),
+			[]byte(st.MerklePath), st.ExtraInfo, competing,
+			[]byte(st.RawTx), st.RetryCount,
+			nextRetry, st.Timestamp, st.CreatedAt,
+		)
+	}
+
+	// Build the VALUES clause: one (...) tuple per row, NULLIF guards mirror
+	// the single-row insert exactly.
+	var values strings.Builder
+	for i := 0; i < len(statuses); i++ {
+		if i > 0 {
+			values.WriteString(", ")
+		}
+		base := i * columnsPerInsertRow
+		fmt.Fprintf(&values,
+			"($%d,$%d,NULLIF($%d,0),NULLIF($%d,''),NULLIF($%d,0),$%d,NULLIF($%d,''),$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7,
+			base+8, base+9, base+10, base+11, base+12, base+13,
+		)
+	}
+
+	q := `
+INSERT INTO transactions (txid, status, status_code, block_hash, block_height,
+    merkle_path, extra_info, competing_txs, raw_tx, retry_count,
+    next_retry_at, timestamp_at, created_at)
+VALUES ` + values.String() + `
+ON CONFLICT (txid) DO UPDATE SET txid = transactions.txid
+RETURNING txid, status, status_code, block_hash, block_height, merkle_path,
+          extra_info, competing_txs, raw_tx, retry_count, next_retry_at,
+          timestamp_at, created_at, (xmax = 0) AS inserted`
+
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("batch insert: %w", err)
+	}
+	defer rows.Close()
+
+	// Postgres doesn't guarantee RETURNING order matches input order. Build a
+	// txid → result map, then assemble the output in input order.
+	byTxID := make(map[string]store.BatchInsertResult, len(statuses))
+	for rows.Next() {
+		st, inserted, err := scanStatusWithInserted(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan batch result: %w", err)
+		}
+		if inserted {
+			byTxID[st.TxID] = store.BatchInsertResult{Inserted: true}
+		} else {
+			byTxID[st.TxID] = store.BatchInsertResult{Existing: st, Inserted: false}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+
+	out := make([]store.BatchInsertResult, len(statuses))
+	for i, st := range statuses {
+		out[i] = byTxID[st.TxID]
+	}
+	return out, nil
+}
+
+// BatchUpdateStatus is the multi-row form of UpdateStatus. Uses
+// UPDATE … FROM (VALUES …) so all rows update in one round-trip. Same
+// partial-update semantics as UpdateStatus: empty fields don't overwrite
+// existing values (handled by NULLIF + COALESCE in the SET clause).
+func (s *Store) BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error {
+	if len(statuses) == 0 {
+		return nil
+	}
+
+	const colsPerRow = 6 // txid, status, block_hash, block_height, extra_info, timestamp_at + merkle_path
+
+	args := make([]any, 0, len(statuses)*(colsPerRow+1))
+	now := time.Now()
+	for _, st := range statuses {
+		ts := st.Timestamp
+		if ts.IsZero() {
+			ts = now
+		}
+		var mp any
+		if len(st.MerklePath) > 0 {
+			mp = []byte(st.MerklePath)
+		}
+		args = append(args,
+			st.TxID,
+			string(st.Status),
+			st.BlockHash,
+			int64(st.BlockHeight),
+			st.ExtraInfo,
+			mp,
+			ts,
+		)
+	}
+
+	var values strings.Builder
+	for i := 0; i < len(statuses); i++ {
+		if i > 0 {
+			values.WriteString(", ")
+		}
+		base := i * (colsPerRow + 1)
+		// Cast text/bytea/bigint/timestamptz so Postgres can pick the right
+		// types for the VALUES alias columns.
+		fmt.Fprintf(&values,
+			"($%d::text,$%d::text,$%d::text,$%d::bigint,$%d::text,$%d::bytea,$%d::timestamptz)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7,
+		)
+	}
+
+	q := `
+UPDATE transactions t SET
+    status       = v.status,
+    block_hash   = COALESCE(NULLIF(v.block_hash, ''),     t.block_hash),
+    block_height = COALESCE(NULLIF(v.block_height, 0),    t.block_height),
+    extra_info   = COALESCE(NULLIF(v.extra_info, ''),     t.extra_info),
+    merkle_path  = COALESCE(v.merkle_path,                t.merkle_path),
+    timestamp_at = v.timestamp_at
+FROM (VALUES ` + values.String() + `) AS v(txid, status, block_hash, block_height, extra_info, merkle_path, timestamp_at)
+WHERE t.txid = v.txid`
+
+	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
+		return fmt.Errorf("batch update: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) UpdateStatus(ctx context.Context, status *models.TransactionStatus) error {
@@ -614,6 +789,58 @@ func (s *Store) ListDatahubEndpoints(ctx context.Context) ([]store.DatahubEndpoi
 
 type rowScanner interface {
 	Scan(dest ...any) error
+}
+
+// scanStatusWithInserted is scanStatus + the boolean `inserted` column
+// returned by BatchGetOrInsertStatus. Kept separate so the row layout for
+// the single-row paths stays identical to the existing scanStatus.
+func scanStatusWithInserted(row rowScanner) (*models.TransactionStatus, bool, error) {
+	var (
+		st           models.TransactionStatus
+		statusCode   *int
+		blockHash    *string
+		blockHeight  *int64
+		merklePath   []byte
+		extraInfo    *string
+		competingTxs []byte
+		rawTx        []byte
+		nextRetry    *time.Time
+		inserted     bool
+	)
+	if err := row.Scan(
+		&st.TxID, &st.Status, &statusCode,
+		&blockHash, &blockHeight, &merklePath,
+		&extraInfo, &competingTxs, &rawTx,
+		&st.RetryCount, &nextRetry,
+		&st.Timestamp, &st.CreatedAt, &inserted,
+	); err != nil {
+		return nil, false, err
+	}
+	if statusCode != nil {
+		st.StatusCode = *statusCode
+	}
+	if blockHash != nil {
+		st.BlockHash = *blockHash
+	}
+	if blockHeight != nil {
+		st.BlockHeight = uint64(*blockHeight)
+	}
+	if len(merklePath) > 0 {
+		st.MerklePath = merklePath
+	}
+	if extraInfo != nil {
+		st.ExtraInfo = *extraInfo
+	}
+	if len(competingTxs) > 0 {
+		_ = json.Unmarshal(competingTxs, &st.CompetingTxs)
+	}
+	if len(rawTx) > 0 {
+		st.RawTx = rawTx
+	}
+	if nextRetry != nil {
+		st.NextRetryAt = *nextRetry
+	}
+	return &st, inserted, nil
 }
 
 func scanStatus(row rowScanner) (*models.TransactionStatus, error) {

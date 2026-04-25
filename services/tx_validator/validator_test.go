@@ -64,6 +64,17 @@ func (m *mockStore) GetOrInsertStatus(_ context.Context, status *models.Transact
 	return &models.TransactionStatus{TxID: status.TxID, Status: models.StatusReceived, Timestamp: time.Now()}, true, nil
 }
 
+// BatchGetOrInsertStatus / BatchUpdateStatus delegate to the per-row methods
+// via the parallel-loop helper so tests exercise the same code path as the
+// non-Postgres backends.
+func (m *mockStore) BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]store.BatchInsertResult, error) {
+	return store.BatchGetOrInsertStatusParallel(ctx, m, statuses)
+}
+
+func (m *mockStore) BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error {
+	return store.BatchUpdateStatusParallel(ctx, m, statuses)
+}
+
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
 	m.updateCallCount.Add(1)
 	m.mu.Lock()

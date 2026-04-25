@@ -36,14 +36,40 @@ type DatahubEndpoint struct {
 	LastSeen time.Time
 }
 
+// BatchInsertResult is one entry in the result slice returned by
+// BatchGetOrInsertStatus. Inserted is true when the row was newly written by
+// this call; false when an existing row was found and Existing carries it.
+// Result ordering matches the input slice ordering.
+type BatchInsertResult struct {
+	Existing *models.TransactionStatus // populated only when !Inserted
+	Inserted bool
+}
+
 // Store handles all persistence operations for transactions and submissions
 type Store interface {
 	// GetOrInsertStatus inserts a new transaction status or returns the existing one if it already exists.
 	// Returns the status, a boolean indicating if it was newly inserted (true) or already existed (false), and any error.
 	GetOrInsertStatus(ctx context.Context, status *models.TransactionStatus) (existing *models.TransactionStatus, inserted bool, err error)
 
+	// BatchGetOrInsertStatus is the multi-row form of GetOrInsertStatus. The
+	// returned slice is in the same order as `statuses` — result[i].Inserted
+	// reports whether statuses[i] was newly inserted, and result[i].Existing
+	// carries the existing row when !Inserted (it is nil for new inserts).
+	//
+	// Backends with native batch support (e.g. Postgres via the xmax trick)
+	// implement this as a single round-trip; backends without (Aerospike,
+	// Pebble) fall back to a bounded-concurrency loop over GetOrInsertStatus.
+	BatchGetOrInsertStatus(ctx context.Context, statuses []*models.TransactionStatus) ([]BatchInsertResult, error)
+
 	// UpdateStatus updates an existing transaction status (used for P2P, blocks, etc.)
 	UpdateStatus(ctx context.Context, status *models.TransactionStatus) error
+
+	// BatchUpdateStatus is the multi-row form of UpdateStatus. Same partial-
+	// update semantics as UpdateStatus — empty fields are ignored, non-empty
+	// fields overwrite. Returns the first error encountered if any. Postgres
+	// implements this in a single round-trip via UPDATE ... FROM (VALUES …);
+	// other backends fall back to a bounded-concurrency loop.
+	BatchUpdateStatus(ctx context.Context, statuses []*models.TransactionStatus) error
 
 	// GetStatus retrieves the status for a transaction
 	GetStatus(ctx context.Context, txid string) (*models.TransactionStatus, error)
