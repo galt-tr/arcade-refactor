@@ -185,8 +185,7 @@ deploy/                 Kubernetes manifests
 
 ## Related projects
 
-- [Existing Arcade](https://github.com/bsv-blockchain/arcade) — the project this repo is a refactor of
 - [Teranode](https://github.com/bsv-blockchain/teranode) — high-throughput Bitcoin SV node; arcade follows its daemon/service patterns
-- [Merkle Service](https://github.com/galt-tr/merkle-service) — registers transactions and emits state callbacks
+- [Merkle Service](https://github.com/bsv-blockchain/merkle-service) — registers transactions and emits state callbacks
 - [go-teranode-p2p-client](https://github.com/bsv-blockchain/go-teranode-p2p-client), [go-p2p-message-bus](https://github.com/bsv-blockchain/go-p2p-message-bus) — libp2p plumbing reused for discovery
 - [BRC-74: BUMP](https://github.com/bitcoin-sv/BRCs/blob/master/transactions/0074.md) — full block merkle-path format
